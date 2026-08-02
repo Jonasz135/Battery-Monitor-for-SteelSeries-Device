@@ -1,0 +1,9 @@
+requests>=2.31.0
+hidapi>=0.14.0
+Pillow>=9.0.0
+customtkinter>=6.0.0
+pystray>=0.19.5
+
+# Tylko do zbudowania BatteryMonitor.exe (python build.py). Do samego
+# uruchomienia programu ze zrodel nie jest potrzebny.
+pyinstaller>=6.0.0

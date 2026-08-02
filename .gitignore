@@ -1,0 +1,30 @@
+# Build / packaging
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+
+# Local user data (lives in %APPDATA%\BatteryMonitor at runtime;
+# copies next to the sources must never land in the repo)
+battery_timeline.json
+battery_history.json
+settings.json
+*.bak
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# One-off debug captures
+probe_pl.png
+*.tmp
