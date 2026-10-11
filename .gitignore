@@ -28,3 +28,4 @@ desktop.ini
 # One-off debug captures
 probe_pl.png
 *.tmp
+.test-tmp/

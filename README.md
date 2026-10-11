@@ -57,17 +57,23 @@ SteelSeries GG is required **only for the keyboard screen**. Battery reads do no
 - OLED layout: device label, remaining time, large %, used since charge, charging animation
 - On-time counter (ignores long offline gaps — sleep / powered off / closed app)
 - Per-device cards, hardware picker, tray + Windows autostart
-- Single-instance `.exe` (~21 MB) or run from source
+- Single-instance `.exe` or run from source
 - UI language: Polish / English
 
 ### Requirements
 
 - Windows
-- [SteelSeries GG](https://steelseries.com/gg) (Engine 3.13+) — for OLED only
+- [SteelSeries GG](https://steelseries.com/gg) (Engine 3.17.9+) — for dynamic OLED images ([SDK](https://github.com/SteelSeries/gamesense-sdk/blob/master/doc/api/json-handlers-screen.md))
 - Keyboard with 128×40 OLED: Apex Pro, Apex Pro TKL, Apex 7, Apex 7 TKL
 - Python 3.8+ — only if you run or build from source
 
 ### Install
+
+**Ready-to-run Windows app**
+
+Download [Battery Monitor v1.1.0 (ZIP)](https://github.com/Jonasz135/Battery-Monitor-for-SteelSeries-Device/releases/download/v1.1.0/BatteryMonitor-v1.1.0-Windows-x64.zip), extract it and run `BatteryMonitor.exe`. Python is not required. The [release page](https://github.com/Jonasz135/Battery-Monitor-for-SteelSeries-Device/releases/latest) also includes the standalone EXE and SHA-256 checksums.
+
+When updating, exit the previous version from its tray menu first. Your settings and battery history stay in `%APPDATA%\BatteryMonitor`.
 
 **From source**
 
@@ -92,7 +98,7 @@ Output: `dist\BatteryMonitor.exe`. User data stays in `%APPDATA%\BatteryMonitor`
 | Family | Examples | Notes |
 | --- | --- | --- |
 | Mice | Aerox 3/5/9, Prime, Rival 3/650… | 2.4 GHz + often Bluetooth |
-| Headsets | Arctis Nova 7/5/4, Arctis 7/9… | Dongle HID protocols |
+| Headsets | Arctis Nova 7/5, Arctis 7/9… | Dongle HID protocols; Nova 4 is listed without battery support |
 | OLED host | Apex Pro / 7 | Display only |
 
 Exact Product IDs and protocols live in [`device_catalog.py`](device_catalog.py) and [`battery_hid.py`](battery_hid.py). Deep dive (cycles, glitch filters, GameSense, tests): **[technical docs in Polish](docs/TECHNICAL.pl.md)**.
@@ -139,17 +145,23 @@ SteelSeries GG jest potrzebne **wyłącznie do ekranu klawiatury**. Odczyt bater
 - OLED: etykieta, czas pracy, duży %, zużycie od naładowania, animacja ładowania
 - Licznik czasu włączenia (długie przerwy — sen, wyłączony sprzęt, zamknięty program — nie wchodzą do licznika)
 - Karty urządzeń, deklaracja sprzętu, zasobnik + autostart Windows
-- Jeden plik `.exe` (~21 MB) albo uruchomienie ze źródeł
+- Jeden plik `.exe` albo uruchomienie ze źródeł
 - Język interfejsu: polski / angielski
 
 ### Wymagania
 
 - Windows
-- [SteelSeries GG](https://steelseries.com/gg) (Engine 3.13+) — tylko pod OLED
+- [SteelSeries GG](https://steelseries.com/gg) (Engine 3.17.9+) — dynamiczne obrazy OLED ([SDK](https://github.com/SteelSeries/gamesense-sdk/blob/master/doc/api/json-handlers-screen.md))
 - Klawiatura z OLED 128×40: Apex Pro, Apex Pro TKL, Apex 7, Apex 7 TKL
 - Python 3.8+ — tylko przy uruchomieniu lub budowie ze źródeł
 
 ### Instalacja
+
+**Gotowa aplikacja Windows**
+
+Pobierz [Battery Monitor v1.1.0 (ZIP)](https://github.com/Jonasz135/Battery-Monitor-for-SteelSeries-Device/releases/download/v1.1.0/BatteryMonitor-v1.1.0-Windows-x64.zip), rozpakuj i uruchom `BatteryMonitor.exe`. Python nie jest potrzebny. Na [stronie wydania](https://github.com/Jonasz135/Battery-Monitor-for-SteelSeries-Device/releases/latest) znajdziesz również sam EXE i sumy kontrolne SHA-256.
+
+Przed aktualizacją zakończ poprzednią wersję przez menu ikony w zasobniku. Ustawienia i historia baterii pozostają w `%APPDATA%\BatteryMonitor`.
 
 **Ze źródeł**
 
@@ -174,11 +186,20 @@ Wynik: `dist\BatteryMonitor.exe`. Dane użytkownika zostają w `%APPDATA%\Batter
 | Rodzina | Przykłady | Uwagi |
 | --- | --- | --- |
 | Myszy | Aerox 3/5/9, Prime, Rival 3/650… | 2.4 GHz + często Bluetooth |
-| Słuchawki | Arctis Nova 7/5/4, Arctis 7/9… | protokoły HID dongle’a |
+| Słuchawki | Arctis Nova 7/5, Arctis 7/9… | protokoły HID dongle’a; Nova 4 jest w katalogu bez obsługi baterii |
 | Ekran OLED | Apex Pro / 7 | tylko wyświetlacz |
 
 Pełna lista PID-ów i protokołów: [`device_catalog.py`](device_catalog.py), [`battery_hid.py`](battery_hid.py).  
 Szczegóły (cykle, filtry błędów, GameSense, testy): **[dokumentacja techniczna](docs/TECHNICAL.pl.md)**.
+
+Wyniki analizy i napraw: **[drugi przegląd](docs/TECHNICAL.pl.md#drugi-przegląd--11-października-2026)**
+oraz **[pierwszy audyt](docs/TECHNICAL.pl.md#audyt-z-11-października-2026)**.
+Testy izolują historię i ustawienia od danych użytkownika:
+
+```powershell
+python run_tests.py
+python run_tests.py --gui --http  # dodatkowo prawdziwe Tk i lokalna atrapa GameSense
+```
 
 ![Wybór sprzętu](screenshot_hardware.png)
 

@@ -365,8 +365,10 @@ _CATALOG = (
         wireless=True,
         protocol="arctis_pro_wireless",
         pids={LINK_24: frozenset({0x1290})},
-        # 20 h lacznie, po 10 h na kazda z dwoch wymiennych baterii.
-        rated_hours={LINK_24: 20.0},
+        # Monitorujemy jedna wlozona baterie: 10 h. Reklamowane 20 h to suma
+        # obu akumulatorow; uzycie jej tutaj podwajaloby przewidywany czas.
+        # https://steelseries.com/press/52-steelseries-launches-arctis-pro-headset-line-first-high-fidelity-and-high
+        rated_hours={LINK_24: 10.0},
     ),
     Device(
         key="arctis_9",
@@ -386,10 +388,11 @@ _CATALOG = (
         label="SLUCHAWKI",
         wireless=True,
         protocol="arctis_7",
-        # 0x1252 i 0x1280 to Arctis Pro 2019 i Pro GameDAC - osobne produkty
-        # dzielace ten protokol. GameDAC jest przewodowy i baterii nie ma,
-        # ale odpowiada na to samo zapytanie.
-        pids={LINK_24: frozenset({0x1260, 0x12AD, 0x1252, 0x1280})},
+        # HeadsetControl obsluguje tez 0x1252 (Arctis Pro) i 0x1280 (GameDAC)
+        # tym protokolem, ale to sluchawki przewodowe bez baterii. Nie sa wiec
+        # modelami monitora baterii, nawet jesli odpowiadaja na te sama komende.
+        # https://support.steelseries.com/hc/en-us/articles/360001702631
+        pids={LINK_24: frozenset({0x1260, 0x12AD})},
         rated_hours={LINK_24: 24.0},
     ),
     Device(
@@ -458,14 +461,19 @@ def find_by_pid(pid):
 def find_by_bt_name(reported_name):
     """Dopasowuje nazwe urzadzenia Bluetooth z Windows do modelu z katalogu.
 
-    Zwraca None, gdy nazwy nie znamy. Dopasowanie jest po jawnej liscie nazw,
+    Zwraca None, gdy nazwy nie znamy. Dopasowanie jest po nazwie handlowej
+    i jawnej liscie aliasow,
     a nie po podobienstwie tekstu: "Arctis 7" jest przedrostkiem "Arctis 7P",
     wiec zgadywanie po fragmencie wybieraloby zly model i przypisywalo mu obcy
     katalogowy czas pracy.
     """
+    if not isinstance(reported_name, str):
+        return None
     normalized = reported_name.strip().casefold()
     for device in _CATALOG:
-        for alias in device.bt_names:
+        if not device.wireless:
+            continue
+        for alias in (device.name,) + device.bt_names:
             if alias.casefold() == normalized:
                 return device
     return None

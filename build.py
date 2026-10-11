@@ -3,6 +3,8 @@
 Uruchomienie:
     python build.py           - zbuduj
     python build.py --clean   - zbuduj od zera, ignorujac cache PyInstallera
+    python build.py --distpath dist/updated --workpath build/updated
+                             - zbuduj osobno, gdy dotychczasowy .exe dziala
 
 Skrypt istnieje zamiast samego "pyinstaller BatteryMonitor.spec" z dwoch powodow:
 sprawdza, czy sa wszystkie zaleznosci i czy ikona jest zbudowana (bez niej
@@ -11,7 +13,7 @@ wypisuje na koniec sciezke i rozmiar gotowego pliku.
 """
 
 import os
-import shutil
+import argparse
 import subprocess
 import sys
 
@@ -30,7 +32,7 @@ def check_dependencies():
     for name in REQUIRED:
         try:
             __import__(name)
-        except ImportError:
+        except (ImportError, OSError):
             missing.append(name)
 
     if missing:
@@ -51,16 +53,26 @@ def check_icon():
     return False
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--clean", action="store_true", help="ignore PyInstaller cache")
+    parser.add_argument("--distpath", default="dist", help="output directory relative to the project")
+    parser.add_argument("--workpath", default="build", help="build cache directory relative to the project")
+    arguments = parser.parse_args(argv)
     if not check_dependencies() or not check_icon():
         return 1
 
-    command = [sys.executable, "-m", "PyInstaller", SPEC, "--noconfirm"]
-    if "--clean" in sys.argv:
+    destination = os.path.abspath(os.path.join(_HERE, arguments.distpath))
+    work = os.path.abspath(os.path.join(_HERE, arguments.workpath))
+    result_path = os.path.join(destination, "BatteryMonitor.exe")
+    command = [
+        sys.executable, "-m", "PyInstaller", SPEC, "--noconfirm",
+        "--distpath", destination, "--workpath", work,
+    ]
+    if arguments.clean:
         command.append("--clean")
-        # Katalog build trzyma cache analizy importow; przy zmianie zaleznosci
-        # potrafi zostawic stary wynik.
-        shutil.rmtree(os.path.join(_HERE, "build"), ignore_errors=True)
+        # PyInstaller czysci wlasny cache. Nie usuwamy calego katalogu build,
+        # ktory moze zawierac tez inne pliki uzytkownika.
 
     print("Budowanie: " + " ".join(command))
     result = subprocess.run(command, cwd=_HERE, check=False)
@@ -68,13 +80,13 @@ def main():
         print("PyInstaller zakonczyl sie bledem.")
         return result.returncode
 
-    if not os.path.isfile(RESULT):
-        print(f"Budowanie sie udalo, ale nie ma pliku {RESULT}.")
+    if not os.path.isfile(result_path):
+        print(f"Budowanie sie udalo, ale nie ma pliku {result_path}.")
         return 1
 
-    size_mb = os.path.getsize(RESULT) / (1024 * 1024)
+    size_mb = os.path.getsize(result_path) / (1024 * 1024)
     print()
-    print(f"Gotowe: {RESULT}  ({size_mb:.1f} MB)")
+    print(f"Gotowe: {result_path}  ({size_mb:.1f} MB)")
     print("Skopiuj ten plik gdziekolwiek chcesz - dane trafiaja do %APPDATA%.")
     return 0
 

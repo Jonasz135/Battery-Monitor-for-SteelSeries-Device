@@ -1,6 +1,152 @@
 ﻿> Dokumentacja techniczna (PL). Opis projektu po polsku i angielsku: [README.md](../README.md).
 # Monitor baterii SteelSeries na OLED Apex Pro
 
+## Drugi przegląd — 11 października 2026
+
+Ponowna analiza sprawdziła dłuższe sekwencje zdarzeń i granice między modułami.
+Znalezione problemy odtworzono dodatkowymi testami przed poprawkami.
+
+| Problem | Objaw przed poprawką | Obecne zachowanie |
+| --- | --- | --- |
+| Powolny HID/Bluetooth | Odczyt zatrzymywał animację i wysyłkę na OLED. | Jeden osobny wątek odczytu; wyświetlanie i ponawianie GG działają niezależnie. |
+| Częste odczyty | Reset rotacji co 10 s pomijał dalsze urządzenia. | Rotacja zachowuje kolejność również przy aktualizacji danych. |
+| GG wyłączone | Podgląd pokazywał stale pierwsze urządzenie i nieruchomy pasek ładowania. | Podgląd obraca urządzenia i animuje pasek bez GG. |
+| Odświeżenie w czasie odczytu | Oczekujące żądanie wielokrotnie przerywało pauzę, powodując serię zbędnych klatek. | Oddzielny, jednorazowy sygnał wybudzenia; żądanie kolejnego odczytu czeka na obecny worker. |
+| Zatrzymanie | Join pod blokadą mógł czekać na callback potrzebujący tej samej blokady. | Join odbywa się poza blokadą; callbacki obu workerów mogą żądać zatrzymania. |
+| Zamykanie GUI | Timeout `stop()` pozwalał zniszczyć okno i zwolnić mutex przy żywym workerze. | GUI czeka asynchronicznie; po wyjątku mainloop kończy worker przed zwolnieniem blokady. |
+| Anulowanie podczas startu | Kolejne etapy rejestracji GG wykonywały się mimo żądania wyjścia. | Sprawdzanie zatrzymania między etapami rejestracji. |
+| Krótkie przerwy offline | Znana przerwa do 180 s lub szybki restart aplikacji zwiększały czas online i zmierzone zużycie. | Jawne przerwanie heartbeat po braku danych, awarii odczytu i zamknięciu. |
+| Awaria całego odczytu | Stary procent nadal miał flagę online, a ponowienie czekało 60 s. | Stare wpisy tracą poziom i flagę online; podgląd oraz karty się odświeżają, a ponowienie używa interwału offline. |
+| Zmiana zegara systemowego | Cofnięcie UTC wstrzymywało nowe próbki; przesunięcie naprzód udawało przerwę offline. | Aktywność bieżącej pracy mierzy zegar monotoniczny. |
+| Ładowanie bez flagi | Stopniowy wzrost po 1% nie rozpoczynał nowej sesji. | Wykrywanie łącznego wzrostu i zachowanie pomiaru sprzed początku ładowania. |
+| Odłączenie kabla offline | Powrót po długiej przerwie udawał zaobserwowany moment odłączenia. | Wskaźnik czasu od ładowania pozostaje nieznany. |
+| Powtórna próbka | Ten sam timestamp mógł potwierdzić odrzucony skok sensora. | Potwierdzenie wymaga późniejszego odczytu. |
+| Migracja dużej historii | Przycięcie do 400 próbek poprzedzało rekonstrukcję pomiarów starych łączy. | Pomiary odtwarza się przed przycięciem. |
+| Pro Wireless i Aerox | Utracony status lub błędny raport zasłaniał właściwy odczyt; nieznany status bywał online. | Ponowienie zapytania o status oraz walidacja raportów bez zmiany komend. |
+| Kroki baterii | Nielegalne wartości surowe, np. 255, mogły zostać przeliczone na 100%. | Walidacja zakresu znanych kroków. |
+| Proces PowerShell | Potomek dziedziczący stdout zatrzymywał cleanup mimo zakończenia helpera. | Cancellable helper używa plików tymczasowych, bez blokujących wątków pipe. |
+| Bardzo długi tekst | OLED mierzył i przechowywał w cache całe wielotysięczne napisy. | Ograniczenie długości przed pomiarem i cache. |
+| Kilka obiektów Settings | Zapis jednego pola przywracał stary wybór innego pola. | Scalanie świeżych danych pod wspólną blokadą ścieżki w procesie. |
+| Migracja przy EXE | Dane obok EXE nie były znajdowane; readonly źródła blokowało późniejsze zapisy. | Sprawdzenie katalogu EXE, kopiowanie samej treści i ochrona nowego pliku przed nadpisaniem. |
+| Start zasobnika i timery | Wczesne zamknięcie/awaria tray lub timer po destroy mogły ukryć aplikację albo wywołać błąd Tcl. | Kolejkowanie żądania, obsługa awarii i anulowanie timerów przed zniszczeniem. |
+| DPI i kilka monitorów | Picker oraz przeniesione okno wychodziły poza ekran mimo stałej liczby kart. | DPI rodzica, aktualny obszar roboczy i przeliczenie layoutu po zmianie monitora. |
+| Build i autostart | Build ignorował docelowy katalog; poprawny autostart bez `--tray` otwierał okno. | Jawne opcje katalogów i naprawa argumentów z zachowaniem prawidłowej lokalizacji programu. |
+
+Przy zamykaniu najpierw kończy się pojedynczy producent historii, następnie
+zapisuje się przerwanie online i wykonuje `flush()`. Testy obejmują również
+odświeżenie i zmianę ustawień podczas odczytu, restart obu workerów oraz
+zatrzymanie z callbacka. Testy regresji nie odpytują urządzeń użytkownika.
+
+Nową wersję można zbudować obok działającej aplikacji:
+
+```powershell
+python build.py --distpath dist/updated --workpath build/updated
+```
+
+Weryfikację wykonuje `python run_tests.py --gui --http`. Test GUI obejmuje
+skalowanie 125/150/200%, przewijanie, otwieranie/zamykanie logu, picker oraz
+awarie zasobnika. Test helpera sprawdza rzeczywisty proces i jego potomka.
+Końcowy wynik drugiej rundy: **254 testy przechodzą**, w tym 166 regresji,
+88 testów pierwotnych oraz włączone scenariusze Tk i HTTP. Dodano 64 testy
+względem pierwszej rundy. Kompilacja źródeł i `git diff --check` przechodzą.
+Nowe `dist/updated/BatteryMonitor.exe` zostało zbudowane; `--help` kończy się
+kodem 0. Działającej starej aplikacji i rzeczywistych danych nie zmieniano.
+
+## Audyt z 11 października 2026
+
+Przeanalizowano wszystkie moduły aplikacji: odczyt HID i Bluetooth, katalog,
+historię, kalkulator czasu, serwis GameSense, renderowanie, GUI, ustawienia,
+lokalizacje danych, pojedynczą instancję, autostart i pakowanie. Naprawy oparto
+na odtwarzających błędy testach, a następnie sprawdzono integrację modułów.
+
+Najważniejsze problemy i zmiany:
+
+| Obszar | Błąd i jego skutek | Poprawka |
+| --- | --- | --- |
+| Deduplikacja | HID jednej myszy ukrywał inną mysz Bluetooth, bo obie miały etykietę `MYSZ`. | Porównywanie klucza modelu; etykieta służy do wyświetlania. |
+| Tożsamość w GUI | Zmiana dongle ↔ BT zostawiała różne nazwy modelu i odrębne karty. | Stała nazwa modelu dla rozpoznanego sprzętu. |
+| Łącze HID | Serwis pomijał `link`, zapisując także kabel jako domyślne 2.4 GHz. | Łącze przechodzi przez cały odczyt i historię. |
+| Filtr skoków | Historia odrzucała błędny odczyt, ale ekran nadal pokazywał surowy procent. | GUI i OLED dostają poziom zaakceptowany przez historię. |
+| Ciągłe odczyty | Po długim stałym poziomie nagły spadek omijał filtr, bo liczono czas od zmiany procentu. | Filtr uwzględnia ostatni udany odczyt. |
+| Szum sensora | Odczyty 90→91→90 były liczone jako rozładowanie. | Zmierzony spadek uwzględnia także małe wzrosty. |
+| Przerwy offline | Spadek baterii podczas przerwy dzielono przez same godziny online. | Zmiany bez zmierzonego czasu nie zasilają tempa sesji. |
+| Mieszane cykle | Dominujące łącze dostawało zużycie i czas także z drugiego łącza. | Zamknięte cykle zapisują osobne pomiary per łącze. |
+| Czas i aliasy | Opóźnione próbki cofały licznik, a scalanie mogło przywrócić stary stan. | Walidacja kolejności oraz zachowanie najnowszego poziomu i ładowania. |
+| Zapis historii | Nieudany zapis był traktowany jak sukces; zamknięcie gubiło końcowe minuty. | Ponawianie nieudanych zapisów i `flush()` przy wyjściu wątku. |
+| Uszkodzone dane | Złe typy, UTF-8, NaN i nieskończoność mogły zatrzymać uruchomienie lub formatowanie. | Walidacja granic wejściowych; poprawne rekordy są zachowywane. |
+| HID | Ciągły strumień raportów mógł zawiesić opróżnianie kolejki; krótki raport zasłaniał poprawny. | Limity odczytu, sprawdzanie długości, krótkich zapisów i anulowania. |
+| Interfejs HID | Awaryjnie wybierano pierwszy dowolny interfejs urządzenia. | Dopasowanie potwierdzonego interfejsu/usage page; brak dopasowania oznacza brak danych. |
+| Zasoby HID | Błąd otwarcia nie zamykał uchwytu, a błąd zamknięcia mógł zgubić odczyt. | Sprzątanie także po nieudanym otwarciu. |
+| Bluetooth | Zapamiętany procent sparowanego urządzenia był traktowany jako bieżący odczyt online. | Sprawdzanie WinRT `System.Devices.Aep.IsConnected` i dopasowanie adresu do PnP. |
+| Dane Bluetooth | Nieprawidłowe wpisy, `true` zamiast procentu, BOM i częściowy stdout psuły odczyt. | Walidacja wpisów, dekodowanie BOM, deduplikacja oraz sprawdzanie kodu wyjścia. |
+| Izolacja błędów | Awaria HID ukrywała działające BT; wyjątek podczas ponawiania zabijał serwis. | Niezależna obsługa transportów i zabezpieczenie zewnętrznej pętli. |
+| Zatrzymywanie | Po timeout usuwano referencję żywego wątku, umożliwiając drugi monitor. | Zachowanie referencji, wynik `stop()` oraz anulowanie helpera PowerShell. |
+| Zmiana sprzętu | Odczyt rozpoczęty przed zmianą deklaracji przywracał stare urządzenia. | Sprawdzenie rewizji ustawień przed publikacją. |
+| Migawki | Konsument mógł zmodyfikować współdzieloną listę odczytów lub parametry statusu. | Izolowane kolekcje, niezmienna klatka i rewizja odczytów do cache GUI. |
+| GameSense | Sesje HTTP pozostawały otwarte; niepoprawny `coreProps.json` wywoływał przypadkowe wyjątki. | Zamykanie sesji, walidacja lokalnego adresu, pomijanie proxy i przekierowań. |
+| Animacja | Wolny HTTP powodował wysyłanie całej zaległej animacji i wydłużał rotację. | Pomijanie przeterminowanych klatek. |
+| OLED | Bardzo długie napisy nachodziły na pozostałe pola. | Skracanie do przydzielonego obszaru i walidacja długości klatki. |
+| Ustawienia | Pamięć zmieniała się przed zapisem; błąd dysku pozostawiał GUI w innym stanie niż plik. | Etapowanie zmian, atomowy zapis i zachowanie poprzedniego wyboru po błędzie. |
+| Tk i zasobnik | Callbacki pystray wywoływały Tk z innego wątku; awaria zasobnika ukrywała aplikację. | Kolejka akcji wykonywana w Tk oraz pokazanie okna po awarii zasobnika. |
+| GUI | Porzucone karty pozostawały w pamięci; wielokrotne wyjście dotykało zniszczonych widgetów. | Niszczenie kart i idempotentne zamykanie. |
+| Wiele kart | Duża deklaracja wypychała przyciski poza ekran. | Przewijana lista urządzeń i ograniczenie wysokości do obszaru roboczego monitora. |
+| Windows 64-bit | Domyślny typ `ctypes` mógł obciąć uchwyt mutexu. | Jawne sygnatury funkcji WinAPI i zwalnianie uchwytu. |
+| Lokalizacja danych | Fallback do katalogu rozpakowanego EXE mógł ginąć przy zamknięciu. | Trwała lokalizacja zapasowa i atomowe przejęcie starych plików. |
+| Autostart i build | Sprawdzano interpreter bez skryptu; spec zależał od katalogu uruchomienia. | Sprawdzanie obu plików oraz ścieżki względem `SPECPATH`. |
+
+Katalog nie odpytuje już przewodowych PID-ów `0x1252` i `0x1280` jako baterii
+Arctis 7. Są to warianty Arctis Pro/Pro + GameDAC, widoczne w
+[implementacji HeadsetControl](https://raw.githubusercontent.com/Sapd/HeadsetControl/master/lib/devices/steelseries_arctis_7.hpp).
+Arctis Pro Wireless używa teraz katalogowych 10 h dla jednej baterii, zamiast
+20 h dla zestawu dwóch baterii. Rozróżnienie wynika z
+[informacji producenta](https://steelseries.com/press/52-steelseries-launches-arctis-pro-headset-line-first-high-fidelity-and-high).
+
+Bluetooth korzysta z właściwości, którą Microsoft opisuje jako informację o
+[aktualnym połączeniu urządzenia](https://learn.microsoft.com/en-us/windows/win32/properties/props-system-devices-aep-isconnected).
+Jeżeli Windows nie udostępnia tego stanu, zapisany wcześniej procent nie jest
+prezentowany jako świeży odczyt online. Zapytanie nie paruje ani nie łączy urządzeń.
+
+### Optymalizacja
+
+Przy braku danych lub kartach offline serwis odpytuje sprzęt co 10 s, zamiast
+przy każdym obrocie pętli. W deterministycznej symulacji pętli wywoływanej raz
+na sekundę przez 60 s oznacza to 7 odczytów zamiast 61, czyli około 89% mniej
+uruchomień odczytu. Przy urządzeniach online zachowano interwał 60 s.
+
+Renderer przechowuje do 128 gotowych klatek i wykorzystuje okresowość animacji.
+Nie zmienia to bitmapy wysyłanej do GameSense. GUI nie przebudowuje obrazu ani
+statusu, gdy zawartość się nie zmieniła; w zasobniku nie renderuje kart/podglądu,
+a takt obsługi okna zmienia się ze 100 na 500 ms. Oszczędności CPU dla całego
+programu wymagają pomiaru z rzeczywistym GG i urządzeniami; podane wyżej 89%
+dotyczy liczby odczytów w konkretnej symulacji, nie całkowitego zużycia CPU.
+
+### Weryfikacja i granice
+
+`python run_tests.py` uruchamia trzy pierwotne zestawy oraz nowe regresje,
+ustawiając osobne katalogi historii, ustawień i plików tymczasowych.
+`python run_tests.py --gui --http` dodatkowo sprawdza prawdziwe ukryte okno Tk
+oraz rejestrację i wysłanie 640-bajtowej klatki do lokalnej atrapy GameSense.
+Testy sprawdzają również anulowanie rzeczywistego procesu pomocniczego i
+wygenerowany regex PowerShell na syntetycznym identyfikatorze PnP.
+Wynik pełnego uruchomienia pierwszej rundy: **190 testów przechodzi** — 88 pierwotnych
+testów i 102 regresje, bez pominiętych scenariuszy opcjonalnych.
+Zbudowano też `dist/updated/BatteryMonitor.exe` (około 25,1 MiB); test uruchomienia
+spakowanego programu z `--help` zakończył się kodem 0. Dotychczasowy plik
+`dist/BatteryMonitor.exe` był używany przez działającą aplikację, więc nowa wersja
+została zapisana osobno. Aby ją uruchomić, zakończ obecną wersję z menu zasobnika.
+
+Historia przechodzi do formatu v5 z trwałym licznikiem zmierzonego spadku per
+łącze. Stare wersje nie zapisywały granic każdej przerwy offline, więc migracja
+nie może odtworzyć informacji, których nie było w pliku. Poprawna separacja
+zużycia dotyczy nowych pomiarów; odzyskiwalne stare próbki i cykle są zachowywane.
+
+Tożsamość nadal opiera się na modelu. Dwa fizyczne egzemplarze tego samego
+modelu nie mają osobnych kart/historii; ich rozróżnienie wymagałoby stabilnych
+identyfikatorów i mapowania między HID a BT. Procenty z firmware pozostają
+skokowe, a szacunek katalogowy nie uwzględnia wieku baterii, RGB ani ustawień
+oszczędzania energii. Obsługa wszystkich rewizji sprzętu oraz fizyczny OLED
+nie zostały potwierdzone na urządzeniach podczas tego audytu.
+
 Program odczytuje **rzeczywisty** poziom baterii bezprzewodowych urządzeń SteelSeries
 i wyświetla go na ekranie OLED klawiatury Apex Pro, korzystając z lokalnego API
 GameSense SDK. Obsługuje oba sposoby podłączenia: 2.4 GHz przez odbiornik USB
@@ -52,8 +198,8 @@ na kropki.
 
 ## Wymagania
 
-- Windows z uruchomionym **SteelSeries GG** (Engine 3.13.0 lub nowszy — starsze
-  wersje nie obsługują wieloliniowych ekranów ani paska postępu)
+- Windows z uruchomionym **SteelSeries GG** (Engine 3.17.9 lub nowszy — aplikacja
+  korzysta z dynamicznych bitmap w danych zdarzenia; [dokumentacja SDK](https://github.com/SteelSeries/gamesense-sdk/blob/master/doc/api/json-handlers-screen.md))
 - Klawiatura z ekranem 128x40: Apex Pro, Apex Pro TKL, Apex 7, Apex 7 TKL
 - Python 3.8+ — tylko do uruchomienia ze źródeł albo zbudowania `.exe`
 
@@ -80,10 +226,8 @@ gdziekolwiek i uruchamiać dwuklikiem. Dane (historia baterii, wybór sprzętu) 
 do `%APPDATA%\BatteryMonitor`, więc program działa też z katalogu tylko do odczytu
 i przeniesienie `.exe` niczego nie gubi.
 
-Rozmiar to około 21 MB, bo w środku siedzi interpreter Pythona z Tk. Start trwa
-2-3 sekundy — tryb jednoplikowy najpierw rozpakowuje zawartość do katalogu
-tymczasowego. Dla programu, który uruchamia się raz na sesję i potem siedzi
-w zasobniku, to nie ma znaczenia; szczegóły decyzji są w
+Rozmiar i czas startu zależą od wersji Pythona i bibliotek — tryb jednoplikowy
+najpierw rozpakowuje zawartość do katalogu tymczasowego. Szczegóły pakowania są w
 [BatteryMonitor.spec](../BatteryMonitor.spec).
 
 ### Ze źródeł
@@ -337,7 +481,7 @@ ID, razem z wariantami regionalnymi i kolejnymi rewizjami sprzętu.
 | `nova_7` | Arctis Nova 7, 7P, 7X | `0x00 0xb0` | skala 0-4 **albo** procent, zależnie od PID-u |
 | `nova_5` | Arctis Nova 5, 5X | `0x00 0xb0` | procent wprost |
 | `arctis_7_plus` | Arctis 7+, 7P+, 7X+ | `0x00 0xb0` | skala 0-4 |
-| `arctis_7` | Arctis 7, Arctis Pro 2019 | `0x06 0x18` | procent wprost |
+| `arctis_7` | Arctis 7, Arctis 7 2019 | `0x06 0x18` | procent wprost |
 | `arctis_1` | Arctis 1 Wireless, Arctis 7P, Arctis 7X | `0x06 0x12` | procent wprost |
 | `arctis_9` | Arctis 9 | `0x00 0x20` | surowy zakres `0x64`-`0x9a` |
 | `arctis_pro_wireless` | Arctis Pro Wireless | `0x41 0xaa`, potem `0x40 0xaa` | skala 0-4 |
@@ -417,7 +561,8 @@ odczyt coś wnosi**:
 - urządzenie odezwało się z innego łącza niż poprzednio,
 - to pierwszy odczyt urządzenia,
 - albo narosło co najmniej kilka minut czasu włączenia przy niezmienionym poziomie
-  (inaczej restart gubiłby godziny, w których bateria stała w miejscu).
+  (inaczej restart gubiłby godziny, w których bateria stała w miejscu),
+- przy normalnym zamknięciu utrwalane są także końcowe minuty od ostatniego zapisu.
 
 Poza tym `record()` nie rusza dysku. Poprzednia wersja przepisywała cały plik przy
 każdym odczycie, czyli raz na minutę na każde urządzenie, mimo że poziom baterii
@@ -432,8 +577,10 @@ zaniżałaby zużycie i zawyżała przewidywany czas pracy. Program liczy tylko 
 sam zobaczył online; bez dodatkowego protokołu „device awake" nie da się inaczej.
 
 W pliku `battery_timeline.json` trzymana jest **bieżąca sesja** w pełni oraz
-**podsumowania zamkniętych cykli** — start, koniec, poziomy, czas włączenia
-i łącze zamiast setki próbek. Tempo rozładowania da się z nich odtworzyć dokładnie, więc
+**podsumowania zamkniętych pomiarów** — start, koniec, zmierzony spadek,
+czas włączenia i łącze zamiast setki próbek. W pomiarach per łącze poziomy
+cyklu opisują zmierzony ubytek; przy przerwach lub różnych miarkach nie są
+rzeczywistymi poziomami początku i końca całej sesji. Tempo rozładowania da się z nich odtworzyć, więc
 pełna historia byłaby marnowaniem miejsca. Wybrałem JSON, a nie SQLite, bo przy
 takiej filtracji jedno urządzenie generuje około stu rekordów na cykl — baza
 danych dodałaby zależność i odebrała możliwość zajrzenia do pliku edytorem, nie
@@ -457,9 +604,11 @@ Licznik zużycia nie schodzi poniżej zera. Urządzenia raportują poziom skokow
 i potrafią się o punkt „cofnąć" w górę bez ładowania, a `ubyło -1%` nie znaczy nic
 sensownego.
 
-Rozpoczęcie ładowania zamyka bieżącą sesję i dopisuje ją do historii — ale tylko
-jeśli cokolwiek z niej wynika: co najmniej 10 punktów spadku w co najmniej pół
-godziny. Cykl z 100% na 95% nie mówi nic o tempie, a zaniżyłby średnią.
+Rozpoczęcie ładowania zamyka bieżącą sesję i dopisuje jej pomiary per łącze do
+historii — ale tylko przy co najmniej 10 zmierzonych punktach spadku w co najmniej
+pół godziny. Poprawnie zmierzony fragment jest zachowywany także po uruchomieniu
+programu przy sprzęcie już pracującym na baterii. Pozwala szacować tempo, lecz
+nie daje podstaw do pokazania niezaobserwowanego czasu od ładowania.
 
 ### Jedna bateria, kilka łączy
 
@@ -562,7 +711,8 @@ python test_devices.py
 python test_i18n.py
 ```
 
-82 testów bez pytest i bez sprzętu. Pierwszy plik pokrywa politykę zapisu,
+88 pierwotnych testów bez pytest i bez sprzętu oraz dodatkowe regresje uruchamiane
+przez `python run_tests.py`. Pierwszy plik pokrywa politykę zapisu,
 wykrywanie granic cykli, czas włączenia (z wyłączeniem luk offline), wagi średniej,
 licznik zużycia, formatowanie czasu na 1% i wszystkie przypadki brzegowe z tabeli
 powyżej — każdy podstawia własne znaczniki czasu, więc czterdziestogodzinny cykl
@@ -628,8 +778,9 @@ nowej lokalizacji, więc powrót do starszej wersji programu wciąż ma swoje da
    czyta właściwość PnP przez PowerShell. Numer interfejsu zależy od rodziny
    protokołu (myszki i większość Arctisów: 3, Nova Pro: 4, Arctis 7: 5, Arctis 9
    i Pro Wireless oraz Rival 650: 0), a usage page nie dla wszystkich modeli jest
-   potwierdzone — dopasowanie ścieżki HID jest więc stopniowe, bo Windows często
-   podaje numer interfejsu jako `-1`. Odczyt jest pasywny, żadne ustawienia
+   potwierdzone — przy numerze `-1` można odczytać `mi_XX` ze ścieżki USB lub
+   użyć potwierdzonego usage page. Dowolny interfejs nie jest wybierany awaryjnie.
+   Odczyt jest pasywny, żadne ustawienia
    urządzenia nie są zmieniane.
 2. **Renderowanie** (`oled_render.py`) — rysuje klatkę 128x40 i zwraca ją jako
    640 bajtów (jeden bit na piksel, najstarszy bit pierwszy), czyli w formacie,
@@ -673,8 +824,9 @@ odczytać niezależnie od niego — okno pozostaje więc użyteczne.
 
 ## Podział na serwis i interfejs
 
-Cała praca dzieje się w `MonitorService` z [monitor_service.py](../monitor_service.py),
-w osobnym wątku. Okno i skrypt konsolowy to tylko dwie skorupy wokół tego samego
+Cała praca dzieje się w `MonitorService` z [monitor_service.py](../monitor_service.py).
+Osobny wątek odczytu mutuje historię, a drugi obsługuje ekran i GG. Przy wyjściu
+historia jest utrwalana dopiero po zakończeniu odczytu. Okno i skrypt konsolowy to tylko dwie skorupy wokół tego samego
 serwisu. Trzy rozwiązania sprawiają, że działa to z interfejsem graficznym:
 
 - **Pauzy są przerywalne.** Zamiast `time.sleep` serwis używa `Event.wait`
@@ -691,8 +843,9 @@ serwisu. Trzy rozwiązania sprawiają, że działa to z interfejsem graficznym:
   odświeża i ją.
 
 Żelazna zasada: wątek serwisu nigdy nie dotyka widgetów, bo tkinter nie jest
-bezpieczny wątkowo. Akcje z menu zasobnika wracają do wątku okna przez
-`after(0, ...)`, bo pystray woła je z własnego wątku.
+bezpieczny wątkowo. Akcje z menu zasobnika trafiają do kolejki, którą opróżnia
+główny wątek Tk. Callback pystray nie wywołuje także `after()`, bo ono również
+wymaga dostępu do interpretera Tk.
 
 ## Gdy urządzenie pokazuje "BRAK DANYCH"
 
@@ -708,7 +861,7 @@ własne zapytanie rozpoznawana jest po echu opcodu w pierwszym bajcie — bez te
 
 Jeśli wszystkie urządzenia są wyłączone, na ekranie pojawia się `BRAK DANYCH`.
 Po włączeniu urządzenia wartość pojawi się w ciągu kilku sekund — w tym stanie
-skrypt ponawia odczyt przy każdym obrocie pętli, nie czekając pełnej minuty.
+serwis ponawia odczyt co 10 s (plus czas samego zapytania), nie czekając pełnej minuty.
 
 Warto też wiedzieć, że niektóre modele aktualizują raportowany procent dość
 rzadko, więc wartość może chwilę "stać" w miejscu.
@@ -720,6 +873,7 @@ Stałe na górze `monitor_service.py`:
 | Stała | Znaczenie |
 | --- | --- |
 | `BATTERY_POLL_SECONDS` | jak często odpytywać baterię (domyślnie 60) |
+| `OFFLINE_POLL_SECONDS` | interwał przy braku danych lub obsługiwanym sprzęcie offline (10 s) |
 | `SCREEN_ROTATE_SECONDS` | jak często przełączać urządzenie na ekranie (domyślnie 4) |
 | `RECONNECT_DELAY_SECONDS` | pauza przed ponowną próbą po błędzie (domyślnie 10) |
 | `ANIMATION_FPS` | klatki na sekundę animacji ładowania (domyślnie 10) |
@@ -735,6 +889,7 @@ Wygląd okna — `app.py`:
 | `WINDOW_WIDTH` | szerokość okna; wysokość dobiera się do liczby urządzeń |
 | `PREVIEW_ZOOM` | powiększenie podglądu ekranu (domyślnie 3, czyli 384x120) |
 | `TICK_MS` | jak często okno odświeża się z migawki serwisu (domyślnie 100) |
+| `TRAY_TICK_MS` | obsługa kolejki i podpowiedzi zasobnika przy ukrytym oknie (500 ms) |
 | `LEVEL_WARN`, `LEVEL_LOW` | progi zmiany koloru paska |
 | `OLED_ON`, `OLED_OFF` | kolory podglądu ekranu |
 | `DETAIL_SEPARATOR` | separator członów w wierszu podsumowania na karcie |

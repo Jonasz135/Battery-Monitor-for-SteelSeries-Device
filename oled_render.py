@@ -25,6 +25,8 @@ Wynikiem jest lista 640 bajtow (128 * 40 / 8), gdzie kazdy bit to jeden piksel,
 najstarszy bit pierwszy, 1 = piksel swiecacy. Taki format wymaga GameSense.
 """
 
+from functools import lru_cache
+
 from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 128
@@ -62,6 +64,10 @@ STRIPE_WIDTH = 4
 # Prog binaryzacji - czcionki TrueType renderuja sie z antyaliasingiem, a ekran
 # jest jednobitowy. Nizszy prog daje grubsze, lepiej widoczne litery.
 _THRESHOLD = 96
+
+# Ekran ma 128 pikseli. Wiecej tekstu nie poprawi obrazu, za to mierzenie
+# i przechowywanie dowolnie dlugich napisow mogloby zatrzymac renderer.
+_MAX_TEXT_CHARACTERS = 256
 
 
 def _load_font(names, size):
@@ -128,6 +134,30 @@ def _fit_font(draw, text, available_width, sizes, available_height=None):
     return FONT_BY_SIZE[sizes[-1]]
 
 
+def _fit_text(draw, text, available_width, sizes, available_height):
+    """Dobiera czcionke i skraca za dlugi tekst do przydzielonego obszaru."""
+    font = _fit_font(draw, text, available_width, sizes, available_height)
+
+    def fits(value):
+        width, height, _, _ = _text_box(draw, value, font)
+        return width <= available_width and height <= available_height
+
+    if fits(text):
+        return text, font
+    if not fits("..."):
+        return "", font
+
+    # Wyszukiwanie binarne ogranicza koszt takze dla dlugich nazw z Windows.
+    left, right = 0, len(text)
+    while left < right:
+        middle = (left + right + 1) // 2
+        if fits(text[:middle] + "..."):
+            left = middle
+        else:
+            right = middle - 1
+    return text[:left] + "...", font
+
+
 def _draw_centered(draw, text, font, x, area_top, area_height):
     """Rysuje napis wyrownany pionowo w podanym pasie ekranu."""
     _, height, offset_x, offset_y = _text_box(draw, text, font)
@@ -180,6 +210,20 @@ def render_frame(
     used_text    - ile ubylo od naladowania, np. "-18%", w pasie z procentem
                    po jego prawej stronie (moze byc pusty)
     """
+    normalized_percent = None if percent is None else max(0, min(100, int(percent)))
+    label_text = label_text[:_MAX_TEXT_CHARACTERS]
+    runtime_text = runtime_text[:_MAX_TEXT_CHARACTERS]
+    used_text = used_text[:_MAX_TEXT_CHARACTERS]
+    # Tylko faza wzoru wplywa na obraz. Numer klatki rozladowywania nie ma
+    # znaczenia, a ladowanie powtarza sie co STRIPE_PERIOD klatek.
+    phase = int(step) % STRIPE_PERIOD if charging and normalized_percent is not None else 0
+    return list(_render_frame_cached(
+        label_text, normalized_percent, runtime_text, bool(charging), phase, used_text
+    ))
+
+
+@lru_cache(maxsize=128)
+def _render_frame_cached(label_text, percent, runtime_text, charging, step, used_text):
     # Rysujemy w odcieniach szarosci, bo czcionki maja antyaliasing, a dopiero
     # na koniec binaryzujemy calosc jednym progiem.
     canvas = Image.new("L", (WIDTH, HEIGHT), 0)
@@ -189,7 +233,7 @@ def render_frame(
         # Komunikat bez danych - nie ma czego pokazywac w drugim wierszu,
         # wiec tekst dostaje oba pasy i moze byc odpowiednio wiekszy.
         message_height = LABEL_AREA_HEIGHT + VALUE_AREA_HEIGHT
-        font = _fit_font(draw, label_text, WIDTH, _MESSAGE_SIZES, message_height)
+        label_text, font = _fit_text(draw, label_text, WIDTH, _MESSAGE_SIZES, message_height)
         _draw_centered(draw, label_text, font, 0, LABEL_AREA_TOP, message_height)
         percent = 0
     else:
@@ -199,7 +243,7 @@ def render_frame(
         # przed dobraniem czcionki nazwy urzadzenia.
         runtime_width = 0
         if runtime_text:
-            runtime_font = _fit_font(
+            runtime_text, runtime_font = _fit_text(
                 draw, runtime_text, RUNTIME_MAX_WIDTH, _RUNTIME_SIZES, LABEL_AREA_HEIGHT
             )
             runtime_width = _text_box(draw, runtime_text, runtime_font)[0]
@@ -213,7 +257,9 @@ def render_frame(
             )
 
         available = WIDTH - runtime_width - (TEXT_GAP if runtime_width else 0)
-        label_font = _fit_font(draw, label_text, available, _LABEL_SIZES)
+        label_text, label_font = _fit_text(
+            draw, label_text, available, _LABEL_SIZES, LABEL_AREA_HEIGHT
+        )
         _draw_centered(draw, label_text, label_font, 0, LABEL_AREA_TOP, LABEL_AREA_HEIGHT)
 
         # Licznik ubytku idzie pierwszy, bo zabiera miejsce duzemu procentowi.
@@ -221,7 +267,7 @@ def render_frame(
         # najwyzej okolo 60 pikseli, a licznik miesci sie w reszcie.
         used_width = 0
         if used_text:
-            used_font = _fit_font(
+            used_text, used_font = _fit_text(
                 draw, used_text, USED_MAX_WIDTH, _USED_SIZES, VALUE_AREA_HEIGHT
             )
             used_width = _text_box(draw, used_text, used_font)[0]
@@ -236,7 +282,7 @@ def render_frame(
 
         value_available = WIDTH - used_width - (TEXT_GAP if used_width else 0)
         value_text = f"+{percent}%" if charging else f"{percent}%"
-        value_font = _fit_font(
+        value_text, value_font = _fit_text(
             draw, value_text, value_available, _VALUE_SIZES, VALUE_AREA_HEIGHT
         )
         _draw_centered(draw, value_text, value_font, 0, VALUE_AREA_TOP, VALUE_AREA_HEIGHT)
@@ -266,12 +312,15 @@ def render_frame(
             )
 
     mono = canvas.point(lambda value: 255 if value >= _THRESHOLD else 0).convert("1")
-    return list(mono.tobytes())
+    return tuple(mono.tobytes())
 
 
 def frame_to_image(data):
     """Zamienia bajty klatki z powrotem na obrazek - do podgladu na monitorze."""
-    return Image.frombytes("1", (WIDTH, HEIGHT), bytes(data))
+    payload = bytes(data)
+    if len(payload) != FRAME_BYTES:
+        raise ValueError(f"OLED frame must contain exactly {FRAME_BYTES} bytes")
+    return Image.frombytes("1", (WIDTH, HEIGHT), payload)
 
 
 # Reprezentatywne stany ekranu, uzywane do wygenerowania podgladu.

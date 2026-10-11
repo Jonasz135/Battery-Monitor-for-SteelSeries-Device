@@ -23,6 +23,8 @@ konkretnej wartosci zamrozilo by go na zawsze przy pierwszym uruchomieniu.
 
 import json
 import os
+import tempfile
+import threading
 
 import i18n
 import paths
@@ -35,6 +37,8 @@ FORMAT_VERSION = 1
 
 # Dozwolone wartosci pola "language": oba jezyki i zyczenie "jak w systemie".
 _LANGUAGE_VALUES = frozenset(i18n.LANGUAGES) | {i18n.AUTO}
+_SAVE_LOCKS = {}
+_SAVE_LOCKS_GUARD = threading.Lock()
 
 
 def _defaults():
@@ -45,7 +49,9 @@ class Settings:
     """Czyta i zapisuje settings.json."""
 
     def __init__(self, path=SETTINGS_PATH):
-        self._path = path
+        self._path = os.path.normcase(os.path.abspath(os.fspath(path)))
+        with _SAVE_LOCKS_GUARD:
+            self._save_lock = _SAVE_LOCKS.setdefault(self._path, threading.RLock())
         self._data = self._load()
 
     # -- odczyt -------------------------------------------------------------
@@ -77,21 +83,41 @@ class Settings:
         """Zapisuje liste zadeklarowanych modeli. Pusta lista wraca do trybu auto."""
         # dict.fromkeys zamiast set(), zeby kolejnosc z okna zostala zachowana -
         # inaczej karty ustawialyby sie losowo przy kazdym uruchomieniu.
-        self._data["declared"] = list(dict.fromkeys(keys))
-        self._save()
+        return self._set_field(
+            "declared", list(dict.fromkeys(key for key in keys if isinstance(key, str)))
+        )
 
     def set_language(self, code):
         """Zapisuje wybor jezyka. Nieznany kod laduje jako "auto"."""
-        self._data["language"] = code if code in _LANGUAGE_VALUES else i18n.AUTO
-        self._save()
+        language = (
+            code if isinstance(code, str) and code in _LANGUAGE_VALUES else i18n.AUTO
+        )
+        return self._set_field("language", language)
+
+    def _set_field(self, field, value):
+        # Okno i serwis maja osobne instancje. Odczyt plus podmiana pod jedna
+        # blokada zapobiega przywroceniu starych wartosci innych pol ustawien.
+        with self._save_lock:
+            try:
+                data = self._load(strict=True)
+            except OSError:
+                return False
+            data[field] = value
+            return self._save(data)
 
     # -- dysk ---------------------------------------------------------------
 
-    def _load(self):
+    def _load(self, strict=False):
         try:
-            with open(self._path, "r", encoding="utf-8") as handle:
+            with open(self._path, "r", encoding="utf-8-sig") as handle:
                 data = json.load(handle)
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return _defaults()
+        except OSError:
+            if strict:
+                raise
+            return _defaults()
+        except (UnicodeError, json.JSONDecodeError):
             return _defaults()
 
         if not isinstance(data, dict):
@@ -102,7 +128,7 @@ class Settings:
             declared = []
 
         language = data.get("language")
-        if language not in _LANGUAGE_VALUES:
+        if not isinstance(language, str) or language not in _LANGUAGE_VALUES:
             language = i18n.AUTO
 
         # Przepisujemy pole po polu, zamiast oddawac wczytany slownik. Plik
@@ -110,19 +136,32 @@ class Settings:
         # tylko to, co rozumie, i w typie, ktorego sie spodziewa.
         return {
             "version": FORMAT_VERSION,
-            "declared": [key for key in declared if isinstance(key, str)],
+            "declared": list(dict.fromkeys(key for key in declared if isinstance(key, str))),
             "language": language,
         }
 
-    def _save(self):
-        """Zapis przez podmiane, zeby przerwanie nie zostawilo polowy pliku."""
-        temporary = self._path + ".tmp"
+    def _save(self, data):
+        """Atomowy zapis; pamiec zmienia sie dopiero po udanej podmianie pliku."""
+        temporary = None
         try:
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(self._data, handle, indent=2)
+            directory = os.path.dirname(os.path.abspath(self._path))
+            os.makedirs(directory, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix=os.path.basename(self._path) + ".", suffix=".tmp", delete=False,
+            ) as handle:
+                temporary = handle.name
+                json.dump(data, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temporary, self._path)
         except OSError:
-            try:
-                os.remove(temporary)
-            except OSError:
-                pass
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
+        self._data = data
+        return True

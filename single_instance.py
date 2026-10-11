@@ -23,6 +23,8 @@ monitor - a to ma sens, bo kazdy z nich ma wlasny wybor sprzetu i wlasna histori
 """
 
 import ctypes
+from ctypes import wintypes
+import atexit
 
 import i18n
 
@@ -39,6 +41,16 @@ _MB_ICONINFORMATION = 0x40
 _handle = None
 
 
+def _kernel32():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # ctypes domyslnie zwraca c_int. HANDLE jest wskaznikiem i na x64 ma 64 bity.
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
 def acquire():
     """Zajmuje blokade. Zwraca True, gdy to pierwszy egzemplarz programu.
 
@@ -49,7 +61,7 @@ def acquire():
     global _handle
 
     try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _kernel32()
         handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
         already = ctypes.get_last_error() == _ERROR_ALREADY_EXISTS
     except (AttributeError, OSError):
@@ -66,6 +78,20 @@ def acquire():
 
     _handle = handle
     return True
+
+
+def release():
+    """Zwalnia nasz uchwyt, takze gdy mainloop skonczyl sie po wyjatku."""
+    global _handle
+    handle, _handle = _handle, None
+    if handle is not None:
+        try:
+            _kernel32().CloseHandle(handle)
+        except (AttributeError, OSError):
+            pass
+
+
+atexit.register(release)
 
 
 def warn_already_running(title="Battery Monitor"):

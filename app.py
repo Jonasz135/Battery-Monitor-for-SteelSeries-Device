@@ -12,8 +12,8 @@ jego migawke stanu i rysuje. Trzy zasady, ktore trzeba tu utrzymac:
   - Watek serwisu nigdy nie dotyka widgetow. Tkinter nie jest bezpieczny
     watkowo, wiec komunikaty ida przez kolejke, a stan przez migawke; jedno
     i drugie odczytuje cykliczne odswiezanie w watku glownym.
-  - Akcje z menu zasobnika wracaja do okna przez after(0, ...), bo pystray
-    wola je z wlasnego watku.
+  - Akcje z menu zasobnika wracaja przez kolejke odczytywana w glownym watku.
+    Takze after() jest wywolaniem Tk i nie wolno go wolac z watku pystray.
   - Zamkniecie okna zwija program do zasobnika, a nie konczy go. Ekran
     klawiatury gasnie kilkanascie sekund po ostatnim zdarzeniu, wiec monitor
     musi dzialac caly czas - wyjscie jest w menu zasobnika.
@@ -26,6 +26,7 @@ przelacznik nie musial ich szukac po drzewie ani ich pominac.
 
 import argparse
 import ctypes
+from ctypes import wintypes
 import os
 import queue
 import sys
@@ -93,6 +94,7 @@ PREVIEW_ZOOM = 3
 # Co ile milisekund okno odswieza sie z migawki serwisu. 100 ms odpowiada
 # 10 klatkom animacji na sekunde, wiec podglad jest tak plynny jak sam OLED.
 TICK_MS = 100
+TRAY_TICK_MS = 500
 
 # Zasoby czytamy przez paths, bo w wersji spakowanej leza w katalogu, do ktorego
 # PyInstaller je rozpakowal, a nie obok pliku programu.
@@ -105,6 +107,59 @@ APP_USER_MODEL_ID = "OLEDbattery.BatteryMonitor"
 
 # Separator czlonow w wierszu podsumowania na karcie urzadzenia.
 DETAIL_SEPARATOR = "  ·  "
+
+
+class _MonitorInfo(ctypes.Structure):
+    _fields_ = [
+        ("size", wintypes.DWORD),
+        ("monitor", wintypes.RECT),
+        ("work", wintypes.RECT),
+        ("flags", wintypes.DWORD),
+    ]
+
+
+def _monitor_work_area(window):
+    """Obszar roboczy aktualnego monitora, w fizycznych pikselach Windows."""
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+        user32.MonitorFromWindow.restype = wintypes.HANDLE
+        user32.GetMonitorInfoW.argtypes = (wintypes.HANDLE, ctypes.POINTER(_MonitorInfo))
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+        monitor = user32.MonitorFromWindow(window.winfo_id(), 2)
+        information = _MonitorInfo()
+        information.size = ctypes.sizeof(information)
+        if monitor and user32.GetMonitorInfoW(monitor, ctypes.byref(information)):
+            area = information.work
+            return area.left, area.top, area.right, area.bottom
+    except (AttributeError, OSError, tk.TclError):
+        pass
+    return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
+
+
+def _cancel_pending_callbacks(widget, all_callbacks=False):
+    """Tk destroy usuwa polecenia Pythona, ale nie usuwa odpowiadajacych after."""
+    try:
+        commands = set()
+        if not all_callbacks:
+            pending_widgets = [widget]
+            while pending_widgets:
+                owner = pending_widgets.pop()
+                commands.update(getattr(owner, "_tclCommands", ()) or ())
+                pending_widgets.extend(owner.winfo_children())
+        for identifier in widget.tk.call("after", "info"):
+            try:
+                script = widget.tk.call("after", "info", identifier)[0]
+                registered = widget.tk.splitlist(script)
+                if all_callbacks or registered and registered[0] in commands:
+                    # after_cancel() usuwa tez polecenie Pythona. Moze ono
+                    # nalezec do dziecka; jego destroy musialby usunac je drugi
+                    # raz. Tutaj anulujemy timer, a polecenie sprzata wlasciciel.
+                    widget.tk.call("after", "cancel", identifier)
+            except tk.TclError:
+                continue
+    except (AttributeError, tk.TclError):
+        pass
 
 
 def level_color(percent, charging):
@@ -235,7 +290,11 @@ class DeviceCard(ctk.CTkFrame):
             # zadna nic nie znaczy, bo poziom wlasnie rosnie.
             return i18n.t("card.charging_in_progress")
 
-        elapsed = reading.get("since_charge")
+        elapsed = (
+            runtime_estimator.format_elapsed(reading["since_charge_hours"])
+            if "since_charge_hours" in reading
+            else reading.get("since_charge")
+        )
         if elapsed:
             parts = [i18n.t("card.since_charge", elapsed=elapsed)]
         else:
@@ -484,11 +543,19 @@ class DevicePicker(ctk.CTkToplevel):
     def _place_over(self, master):
         """Ustawia okno na srodku okna glownego, ale w granicach ekranu."""
         self.update_idletasks()
-        x = master.winfo_x() + (master.winfo_width() - self.WIDTH) // 2
-        y = master.winfo_y() + (master.winfo_height() - self.HEIGHT) // 2
-        x = max(0, min(x, self.winfo_screenwidth() - self.WIDTH))
-        y = max(0, min(y, self.winfo_screenheight() - self.HEIGHT))
-        self.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+        # Toplevel startuje na domyslnym monitorze. Docelowy DPI pochodzi z
+        # rodzica, zanim Windows zdazy przeskalowac nowe okno po przeniesieniu.
+        scaling = ctk.ScalingTracker.get_window_scaling(master)
+        left, top, right, bottom = _monitor_work_area(master)
+        decoration = round(48 * scaling)
+        width = min(self.WIDTH, max(1, int((right - left) / scaling)))
+        height = min(self.HEIGHT, max(1, int((bottom - top - decoration) / scaling)))
+        physical_width, physical_height = round(width * scaling), round(height * scaling)
+        x = master.winfo_x() + (master.winfo_width() - physical_width) // 2
+        y = master.winfo_y() + (master.winfo_height() - physical_height) // 2
+        x = max(left, min(x, right - physical_width))
+        y = max(top, min(y, bottom - physical_height - decoration))
+        self.geometry(f"{width}x{height}+{x}+{y}")
 
     # -- reakcje ------------------------------------------------------------
 
@@ -525,8 +592,14 @@ class DevicePicker(ctk.CTkToplevel):
         self._refresh_warning()
 
     def _save(self):
-        self._on_save(self._selected())
-        self.destroy()
+        if self._on_save(self._selected()):
+            self.destroy()
+        else:
+            self._warning.configure(text=i18n.t("log.settings_failed"))
+
+    def destroy(self):
+        _cancel_pending_callbacks(self)
+        super().destroy()
 
 
 # ---------------------------------------------------------------------------
@@ -546,11 +619,20 @@ class App(ctk.CTk):
         self._apply_icon()
 
         self._log_queue = queue.Queue()
+        self._ui_queue = queue.Queue()
         self._last_frame = None
         self._last_readings = None
+        self._last_readings_revision = None
+        self._last_status = None
+        self._last_tooltip = None
+        self._last_layout_key = None
+        self._last_layout_check = 0.0
         self._preview_image = None
         self._log_visible = False
         self._quitting = False
+        self._shutdown_complete = False
+        self._shutdown_id = None
+        self._hide_requested = False
         self._card_count = None
         self._tick_id = None
         self._picker = None
@@ -581,8 +663,15 @@ class App(ctk.CTk):
         self._build_footer()
         self._build_log()
 
-        self._tray = self._build_tray()
-        threading.Thread(target=self._tray.run, name="Tray", daemon=True).start()
+        self._tray_ready = threading.Event()
+        self._tray = None
+        self._tray_thread = None
+        try:
+            self._tray = self._build_tray()
+        except Exception as exc:
+            self._ui_queue.put(lambda error=str(exc): self._handle_tray_failure(error))
+        else:
+            self._tray_thread = threading.Thread(target=self._run_tray, name="Tray", daemon=True)
 
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
@@ -603,8 +692,15 @@ class App(ctk.CTk):
         if autostart.repair_if_stale():
             self._log_queue.put(i18n.t("log.autostart_repaired"))
 
-        self.service.start()
-        self._tick()
+        try:
+            self.service.start()
+            if self._tray_thread is not None:
+                self._tray_thread.start()
+            self._tick()
+        except BaseException:
+            self._quitting = True
+            self.wait_for_shutdown()
+            raise
 
     # -- budowa interfejsu --------------------------------------------------
 
@@ -700,7 +796,12 @@ class App(ctk.CTk):
         self._track(section, "section.screen")
 
         # Ramka udaje obudowe ekranu, zeby podglad nie zlewal sie z tlem okna.
-        bezel = ctk.CTkFrame(wrapper, fg_color="#0E0E11", corner_radius=8)
+        bezel = ctk.CTkFrame(
+            wrapper, fg_color="#0E0E11", corner_radius=8,
+            width=oled_render.WIDTH * PREVIEW_ZOOM + 20,
+            height=oled_render.HEIGHT * PREVIEW_ZOOM + 20,
+        )
+        self._preview_bezel = bezel
         bezel.grid(row=1, column=0)
 
         # Pusta klatka jako obraz startowy. Etykieta bierze rozmiar z obrazu -
@@ -722,8 +823,19 @@ class App(ctk.CTk):
         self.preview.pack(padx=10, pady=10)
 
     def _build_devices(self):
-        self.devices = ctk.CTkFrame(self, fg_color="transparent")
-        self.devices.grid(row=2, column=0, sticky="ew", padx=16)
+        # Kontener ma kontrolowana wysokosc. Sama zawartosc moze byc dowolnie
+        # wysoka, a przy dlugiej deklaracji przewija sie bez ukrywania przyciskow.
+        self._devices_container = ctk.CTkFrame(
+            self, fg_color="transparent", corner_radius=0, height=1
+        )
+        self._devices_container.grid(row=2, column=0, sticky="ew", padx=16)
+        self._devices_container.grid_propagate(False)
+        self._devices_container.grid_rowconfigure(0, weight=1)
+        self._devices_container.grid_columnconfigure(0, weight=1)
+        self.devices = ctk.CTkScrollableFrame(
+            self._devices_container, fg_color="transparent", corner_radius=0, height=1
+        )
+        self.devices.grid(row=0, column=0, sticky="nsew")
         self.devices.grid_columnconfigure(0, weight=1)
 
         self.empty_label = ctk.CTkLabel(
@@ -867,11 +979,11 @@ class App(ctk.CTk):
     # -- zasobnik -----------------------------------------------------------
 
     def _build_tray(self):
-        image = (
-            Image.open(LOGO_PATH)
-            if os.path.isfile(LOGO_PATH)
-            else Image.new("RGB", (64, 64), ACCENT)
-        )
+        if os.path.isfile(LOGO_PATH):
+            with Image.open(LOGO_PATH) as source:
+                image = source.convert("RGBA")
+        else:
+            image = Image.new("RGB", (64, 64), ACCENT)
         # Napisy jako funkcje, nie napisy: pystray wola je za kazdym otwarciem
         # menu, wiec po zmianie jezyka menu jest juz przetlumaczone i nie trzeba
         # go przebudowywac.
@@ -883,18 +995,59 @@ class App(ctk.CTk):
         )
         return pystray.Icon("battery_monitor", image, APP_TITLE, menu)
 
-    # Menu zasobnika dziala we wlasnym watku pystray, wiec kazda akcja musi
-    # wrocic do watku tkintera - stad after(0, ...).
+    def _run_tray(self):
+        error = "The system tray stopped unexpectedly."
+        try:
+            self._tray.run(setup=self._setup_tray)
+        except Exception as exc:
+            error = str(exc)
+        finally:
+            self._tray_ready.clear()
+            if not self._quitting:
+                self._ui_queue.put(lambda message=error: self._handle_tray_failure(message))
+
+    def _setup_tray(self, icon):
+        if self._quitting:
+            return
+        try:
+            icon.visible = True
+            if self._quitting:
+                icon.visible = False
+                return
+            self._tray_ready.set()
+            if self._hide_requested:
+                self._ui_queue.put(self.hide_to_tray)
+        except Exception as exc:
+            self._ui_queue.put(lambda error=str(exc): self._handle_tray_failure(error))
+
+    def _handle_tray_failure(self, error):
+        if self._quitting:
+            return
+        self._hide_requested = False
+        self._tray_ready.clear()
+        self._log_queue.put(i18n.t("log.tray_failed", error=error))
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
+        self.show_window()
+
+    # Nawet after() dotyka Tk. Callbacki pystray tylko zapisują akcje do kolejki.
     def _tray_show(self, icon=None, item=None):
-        self.after(0, self.show_window)
+        if not self._quitting:
+            self._ui_queue.put(self.show_window)
 
     def _tray_refresh(self, icon=None, item=None):
-        self.after(0, self.refresh_now)
+        if not self._quitting:
+            self._ui_queue.put(self.refresh_now)
 
     def _tray_quit(self, icon=None, item=None):
-        self.after(0, self.quit_app)
+        if not self._quitting:
+            self._ui_queue.put(self.quit_app)
 
     def hide_to_tray(self):
+        if not self._tray_ready.is_set():
+            # Okno musi zostac dostepne, dopoki ikona nie zostala utworzona.
+            self._hide_requested = True
+            return
+        self._hide_requested = False
         self.withdraw()
         try:
             self._tray.notify(i18n.t("tray.hidden"), APP_TITLE)
@@ -903,6 +1056,7 @@ class App(ctk.CTk):
             pass
 
     def show_window(self):
+        self._hide_requested = False
         self.deiconify()
         # Przy starcie do zasobnika okno nigdy nie bylo pokazane, a w tym stanie
         # samo deiconify() nie zawsze wystarcza - stan "withdrawn" trzeba
@@ -910,6 +1064,11 @@ class App(ctk.CTk):
         self.state("normal")
         self.lift()
         self.focus_force()
+        self._check_display_layout(force=True)
+        snapshot = self.service.get_snapshot()
+        self._update_status(snapshot)
+        self._update_devices(snapshot)
+        self._update_preview(snapshot)
 
     # -- akcje --------------------------------------------------------------
 
@@ -928,14 +1087,19 @@ class App(ctk.CTk):
 
     def _apply_declaration(self, keys):
         """Zapisuje wybor i kaze serwisowi odczytac go od nowa."""
-        self.settings.set_declared(keys)
+        if not self.settings.set_declared(keys):
+            self._log_queue.put(i18n.t("log.settings_failed"))
+            if not self._log_visible:
+                self.toggle_log()
+            return False
 
         # Karty odpowiadaja poprzedniej deklaracji, wiec musza zniknac razem
         # z nia - serwis zbuduje liste na nowo przy najblizszym odczycie.
         for card in self._cards.values():
-            card.grid_remove()
+            card.destroy()
         self._cards.clear()
         self._last_readings = None
+        self._last_readings_revision = None
 
         self.service.reload_settings()
 
@@ -943,6 +1107,7 @@ class App(ctk.CTk):
         self._log_queue.put(
             i18n.t("log.declared", count=count) if count else i18n.t("log.automatic")
         )
+        return True
 
     def toggle_pause(self):
         self.service.set_paused(not self.service.is_paused())
@@ -987,10 +1152,15 @@ class App(ctk.CTk):
         if code == i18n.language():
             return
 
-        i18n.set_language(code)
         # Zapisujemy konkretny kod, nie "auto": skoro uzytkownik wybral jezyk
         # recznie, program ma go trzymac takze wtedy, gdy Windows zmieni swoj.
-        self.settings.set_language(code)
+        if not self.settings.set_language(code):
+            self.language_switch.set(i18n.LANGUAGE_NAMES[i18n.language()])
+            self._log_queue.put(i18n.t("log.settings_failed"))
+            if not self._log_visible:
+                self.toggle_log()
+            return
+        i18n.set_language(code)
 
         self.retranslate()
         self._log_queue.put(i18n.t("log.language"))
@@ -1011,6 +1181,8 @@ class App(ctk.CTk):
         # Bez tego napisy na kartach zostalyby w poprzednim jezyku do nastepnego
         # odczytu baterii, czyli nawet minute.
         self._last_readings = None
+        self._last_readings_revision = None
+        self._last_tooltip = None
 
         # Klatka na klawiaturze powstaje w watku serwisu i trwa do konca cyklu
         # wyswietlania. Bez przerwania tej pauzy ekran - i podglad w oknie -
@@ -1043,48 +1215,154 @@ class App(ctk.CTk):
         widgety CustomTkinter maja wlasny domyslny rozmiar 200x200, wiec
         zadana wysokosc okna jest suma tych domyslnych, a nie wysokoscia tresci.
         """
+        scaling = ctk.ScalingTracker.get_window_scaling(self)
+        widget_scaling = ctk.ScalingTracker.get_widget_scaling(self)
+        left, top, right, bottom = _monitor_work_area(self)
+        # Zostawiamy miejsce na ramke i belke okna, poza obszarem klienta Tk.
+        decoration = round(48 * scaling)
+        maximum = max(1, bottom - top - decoration)
+        # PhotoImage i zwykla etykieta Tk maja rozmiar fizyczny. Skalowanie
+        # samej obudowy CTk nie moze dodawac pustego miejsca pod podgladem.
+        self._preview_bezel.configure(
+            width=(oled_render.WIDTH * PREVIEW_ZOOM + 20) / widget_scaling,
+            height=(oled_render.HEIGHT * PREVIEW_ZOOM + 20) / widget_scaling,
+        )
+        if self._log_visible:
+            self.log_box.configure(height=150)
+        self._devices_container.configure(height=1)
         self.geometry(f"{WINDOW_WIDTH}x{AUTOSIZE_PROBE_HEIGHT}")
         self.update_idletasks()
 
         last = self.log_box if self._log_visible else self.footer_status
-        needed = last.winfo_y() + last.winfo_height() + AUTOSIZE_BOTTOM_PAD
+        fixed = (
+            last.winfo_y() + last.winfo_height() + AUTOSIZE_BOTTOM_PAD
+            - self._devices_container.winfo_height()
+        )
+        if self._log_visible and fixed >= maximum:
+            height = max(1, self.log_box.winfo_height() - (fixed - maximum + 1))
+            self.log_box.configure(height=max(1, int(height / widget_scaling)))
+            self.update_idletasks()
+            fixed = (
+                last.winfo_y() + last.winfo_height() + AUTOSIZE_BOTTOM_PAD
+                - self._devices_container.winfo_height()
+            )
+        content = self.devices.winfo_reqheight()
+        viewport = max(1, min(content, maximum - fixed))
+        self._devices_container.configure(height=max(1, int(viewport / widget_scaling)))
+        self.update_idletasks()
+        needed = min(maximum, last.winfo_y() + last.winfo_height() + AUTOSIZE_BOTTOM_PAD)
 
         # winfo_* podaje piksele fizyczne, a CTk.geometry sam mnozy przez
         # skalowanie okna - bez podzielenia wynik bylby przeskalowany dwukrotnie.
-        scaling = ctk.ScalingTracker.get_window_scaling(self)
-        self.geometry(f"{WINDOW_WIDTH}x{max(1, round(needed / scaling))}")
+        height = max(1, int(needed / scaling))
+        x = max(left, min(self.winfo_x(), right - round(WINDOW_WIDTH * scaling)))
+        y = max(top, min(self.winfo_y(), bottom - round(height * scaling) - decoration))
+        self.geometry(f"{WINDOW_WIDTH}x{height}+{x}+{y}")
+        self._last_layout_key = ((left, top, right, bottom), scaling, widget_scaling)
+        self._last_layout_check = time.monotonic()
+
+    def _check_display_layout(self, force=False):
+        now = time.monotonic()
+        if not force and now - self._last_layout_check < 1.0:
+            return
+        self._last_layout_check = now
+        key = (
+            _monitor_work_area(self), ctk.ScalingTracker.get_window_scaling(self),
+            ctk.ScalingTracker.get_widget_scaling(self),
+        )
+        if key != self._last_layout_key:
+            self._autosize()
 
     def quit_app(self):
+        if self._quitting:
+            return
         self._quitting = True
         # Zaplanowane odswiezenie trzeba odwolac przed zniszczeniem okna,
         # inaczej Tcl probuje wywolac je na juz nieistniejacych widgetach.
         if self._tick_id is not None:
-            self.after_cancel(self._tick_id)
+            try:
+                self.after_cancel(self._tick_id)
+            except tk.TclError:
+                pass
             self._tick_id = None
+        self._finish_shutdown()
+
+    def _finish_shutdown(self):
+        self._shutdown_id = None
+        # Timeout nie oznacza zakonczenia pracy. Tk i mutex pozostaja zywe,
+        # dopoki worker nie zapisze historii i nie odda urzadzen.
+        if self.service.stop(timeout=0) is False:
+            self._shutdown_id = self.after(TICK_MS, self._finish_shutdown)
+            return False
+        self._finalize_shutdown()
+        return True
+
+    def _finalize_shutdown(self):
+        if self._shutdown_complete:
+            return
+        if self._shutdown_id is not None:
+            try:
+                self.after_cancel(self._shutdown_id)
+            except tk.TclError:
+                pass
+            self._shutdown_id = None
         try:
-            self._tray.stop()
+            if self._tray is not None:
+                self._tray.stop()
         except Exception:
             pass
-        self.service.stop()
-        self.destroy()
+        self._shutdown_complete = True
+        _cancel_pending_callbacks(self, all_callbacks=True)
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def wait_for_shutdown(self):
+        """Domyka worker takze po wyjatku mainloop, gdy after juz nie dziala."""
+        if self._shutdown_complete:
+            return True
+        if self.service.stop(timeout=None) is False:
+            return False
+        self._finalize_shutdown()
+        return True
 
     # -- odswiezanie --------------------------------------------------------
 
     def _tick(self):
+        self._tick_id = None
         if self._quitting:
             return
 
+        self._drain_ui_actions()
+        if self._quitting:
+            return
         self._drain_log()
         snapshot = self.service.get_snapshot()
-        self._update_status(snapshot)
-        self._update_devices(snapshot)
-        self._update_preview(snapshot)
+        hidden = self.state() == "withdrawn"
+        if hidden:
+            self._update_tray_tooltip(snapshot["readings"])
+        else:
+            self._check_display_layout()
+            self._update_status(snapshot)
+            self._update_devices(snapshot)
+            self._update_preview(snapshot)
 
-        self._tick_id = self.after(TICK_MS, self._tick)
+        self._tick_id = self.after(TRAY_TICK_MS if hidden else TICK_MS, self._tick)
+
+    def _drain_ui_actions(self):
+        for _ in range(100):
+            try:
+                action = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            action()
+            if self._quitting:
+                return
 
     def _drain_log(self):
         lines = []
-        while True:
+        for _ in range(200):
             try:
                 lines.append(self._log_queue.get_nowait())
             except queue.Empty:
@@ -1095,8 +1373,9 @@ class App(ctk.CTk):
         self.log_box.configure(state="normal")
         self.log_box.insert("end", "\n".join(lines) + "\n")
         # Bez limitu panel rosnie bez konca przy pracy liczonej w dniach.
-        if float(self.log_box.index("end")) > 400:
-            self.log_box.delete("1.0", "200.0")
+        line_count = int(self.log_box.index("end-1c").split(".")[0])
+        if line_count > 400:
+            self.log_box.delete("1.0", f"{line_count - 400 + 1}.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -1115,7 +1394,7 @@ class App(ctk.CTk):
 
         # Kropka jest w kodzie, nie w tlumaczeniu: to element graficzny wskaznika,
         # taki sam w kazdym jezyku.
-        self.status_label.configure(text=f"● {i18n.t(key)}", text_color=color)
+        status_text = f"● {i18n.t(key)}"
 
         if snapshot["connected"]:
             last_poll = snapshot["last_poll"]
@@ -1126,15 +1405,23 @@ class App(ctk.CTk):
             # powstaje tutaj i jest zawsze w aktualnym jezyku.
             detail = i18n.t(snapshot["status_key"], **snapshot["status_params"])
 
-        self.footer_status.configure(text=detail)
+        status = (status_text, color, detail)
+        if status != self._last_status:
+            self.status_label.configure(text=status_text, text_color=color)
+            self.footer_status.configure(text=detail)
+            self._last_status = status
 
     def _update_devices(self, snapshot):
         readings = snapshot["readings"]
-        # Serwis podmienia liste na nowa przy kazdym odczycie, wiec porownanie
-        # tozsamosci wystarczy i nie ma potrzeby porownywac zawartosci.
-        if readings is self._last_readings:
+        # Migawki izolują kolekcje, wiec ich tozsamosc nie znaczy nowego odczytu.
+        revision = snapshot.get("readings_revision")
+        if revision is not None:
+            if revision == self._last_readings_revision:
+                return
+        elif readings == self._last_readings:
             return
         self._last_readings = readings
+        self._last_readings_revision = revision
 
         # Karty kluczujemy modelem, a nie etykieta: etykieta jest kategoria
         # ("MYSZ"), wiec dwie zadeklarowane myszki dzielilyby jedna karte
@@ -1148,9 +1435,10 @@ class App(ctk.CTk):
             card.update_reading(reading)
 
         active = {reading["model"] for reading in readings}
-        for model, card in self._cards.items():
+        for model, card in list(self._cards.items()):
             if model not in active:
-                card.grid_remove()
+                card.destroy()
+                del self._cards[model]
 
         if readings:
             self.empty_label.grid_remove()
@@ -1176,14 +1464,19 @@ class App(ctk.CTk):
             title = f"{APP_TITLE} - " + "  ".join(parts)
         else:
             title = f"{APP_TITLE} - {i18n.t('tray.no_devices')}"
+        # Windows ogranicza podpowiedz Shell_NotifyIcon do 127 znakow.
+        title = title[:127]
+        if title == self._last_tooltip:
+            return
         try:
             self._tray.title = title
+            self._last_tooltip = title
         except Exception:
             pass
 
     def _update_preview(self, snapshot):
         frame = snapshot["frame"]
-        if frame is None or frame is self._last_frame:
+        if frame is None or frame is self._last_frame or frame == self._last_frame:
             return
         self._last_frame = frame
 
@@ -1220,9 +1513,20 @@ def main(argv=None):
             single_instance.warn_already_running(APP_TITLE)
         return 0
 
-    ctk.set_appearance_mode("dark")
-    app = App(start_hidden=options.tray)
-    app.mainloop()
+    app = None
+    try:
+        ctk.set_appearance_mode("dark")
+        app = App(start_hidden=options.tray)
+        app.mainloop()
+    finally:
+        can_release = app is None
+        try:
+            if app is not None:
+                app.quit_app()
+                can_release = app.wait_for_shutdown() is not False
+        finally:
+            if can_release:
+                single_instance.release()
     return 0
 
 

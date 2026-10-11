@@ -27,15 +27,18 @@ program wystartowalby i natychmiast padl na braku pliku motywu.
 """
 
 from PyInstaller.utils.hooks import collect_all
+import os
+
+_HERE = os.path.abspath(SPECPATH)
 
 # Motywy i czcionki customtkinter sa wczytywane z dysku, nie importowane.
 ctk_datas, ctk_binaries, ctk_hidden = collect_all("customtkinter")
 
 analysis = Analysis(
-    ["app.py"],
-    pathex=[],
+    [os.path.join(_HERE, "app.py")],
+    pathex=[_HERE],
     binaries=ctk_binaries,
-    datas=[("assets", "assets")] + ctk_datas,
+    datas=[(os.path.join(_HERE, "assets"), "assets")] + ctk_datas,
     hiddenimports=[
         # pystray i PIL wybieraja backend dopiero w czasie dzialania, po
         # sprawdzeniu systemu. Statyczna analiza importow tego nie widzi.
@@ -73,5 +76,5 @@ executable = EXE(
     runtime_tmpdir=None,
     # Program okienkowy: bez tego przy kazdym starcie migalaby konsola.
     console=False,
-    icon="assets/icon.ico",
+    icon=os.path.join(_HERE, "assets", "icon.ico"),
 )

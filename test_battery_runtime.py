@@ -46,8 +46,11 @@ def advance_online(
 ):
     """Symuluje urzadzenie widziane online od start do end.
 
-    Heartbeaty co "step" sekund utrzymuja czas wlaczenia. Na znaczniku "end"
-    ustawiany jest end_level (domyslnie ten sam co level). Zaklada, ze w "start"
+    Heartbeaty co "step" sekund utrzymuja czas wlaczenia. Duzy spadek rozkladamy
+    na kroki po 5 punktow przez caly odcinek: 40 godzin plaskiego 100% i skok
+    do 20% w ostatniej minucie odtwarzalyby blad sensora, nie cykl baterii.
+    Na znaczniku "end" ustawiany jest end_level (domyslnie ten sam co level).
+    Zaklada, ze w "start"
     jest juz wpisany odczyt (np. odlaczenie kabla) - pierwszy heartbeat idzie
     w start+step, zeby nie dublowac tego samego znacznika.
     """
@@ -56,7 +59,11 @@ def advance_online(
 
     moment = start + step
     while moment < end - 1e-9:
-        timeline.record(key, level, charging, now=moment, link=link)
+        current = level
+        if not charging and level - end_level >= battery_timeline.GLITCH_MIN_DROP and end > start:
+            drop = (level - end_level) * (moment - start) / (end - start)
+            current = max(end_level, level - int(drop // 5) * 5)
+        timeline.record(key, current, charging, now=moment, link=link)
         moment += step
 
     return timeline.record(key, end_level, charging, now=end, link=link)
@@ -161,6 +168,7 @@ def test_round_trip(workspace):
     print("\n1c. Dane przetrwaja restart programu")
     timeline = workspace.timeline()
     timeline.record("Mysz", 100, True, now=0.0)
+    timeline.record("Mysz", 100, True, now=1 * HOUR - STEP)
     timeline.record("Mysz", 100, False, now=1 * HOUR)
     advance_online(timeline, "Mysz", 100, False, 1 * HOUR, 11 * HOUR, end_level=90)
 
@@ -188,6 +196,7 @@ def test_charge_end_detection(workspace):
 
     timeline.record("Mysz", 60, True, now=0.0)
     timeline.record("Mysz", 80, True, now=2 * HOUR)
+    timeline.record("Mysz", 100, True, now=5 * HOUR - STEP)
     state = timeline.record("Mysz", 100, False, now=5 * HOUR)
 
     check(close_to(state.charge_end, 5 * HOUR), "timestamp odlaczenia kabla", f"{state.charge_end}")
@@ -217,6 +226,7 @@ def test_drop_since_charge(workspace):
     timeline = workspace.timeline()
 
     timeline.record("Mysz", 100, True, now=0.0)
+    timeline.record("Mysz", 100, True, now=1 * HOUR - STEP)
     state = timeline.record("Mysz", 100, False, now=1 * HOUR)
     check(state.drop_since_charge == 0, "zaraz po odlaczeniu kabla nic nie ubylo")
 
@@ -227,6 +237,7 @@ def test_drop_since_charge(workspace):
     # ubytek nie znaczy nic sensownego, wiec licznik zatrzymuje sie na zerze.
     fresh = workspace.timeline()
     fresh.record("Sluchawki", 60, True, now=0.0)
+    fresh.record("Sluchawki", 60, True, now=1 * HOUR - STEP)
     fresh.record("Sluchawki", 60, False, now=1 * HOUR)
     bumped = fresh.record("Sluchawki", 62, False, now=1 * HOUR + 60)
     check(bumped.drop_since_charge == 0, "wzrost poziomu nie daje ujemnego ubytku")

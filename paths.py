@@ -25,6 +25,7 @@ na .exe wygladaloby jak utrata calej historii.
 import os
 import shutil
 import sys
+import tempfile
 
 # Nazwa katalogu w %APPDATA%. Bez spacji, bo trafia tez do wpisu w rejestrze
 # i do sciezek w komunikatach.
@@ -63,22 +64,31 @@ def program_path():
 def data_dir():
     """Katalog na dane uzytkownika, utworzony przy pierwszym uzyciu.
 
-    Gdy %APPDATA% jest niedostepne albo nie da sie tam pisac, wracamy do
-    katalogu programu. Utrata historii jest mniej szkodliwa niz program, ktory
-    nie chce sie uruchomic.
+    Zapasowe lokalizacje tez sa trwale: %LOCALAPPDATA%, potem katalog domowy.
+    Katalog rozpakowanego .exe nie moze byc miejscem zapisu danych.
     """
     global _data_dir
     if _data_dir is not None:
         return _data_dir
 
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    candidate = os.path.join(base, APP_DIR_NAME)
-
-    try:
-        os.makedirs(candidate, exist_ok=True)
+    bases = [os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA"), os.path.expanduser("~")]
+    candidates = list(dict.fromkeys(os.path.join(base, APP_DIR_NAME) for base in bases if base))
+    for candidate in candidates:
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            # Istnienie katalogu nie potwierdza prawa zapisu (np. odziedziczone
+            # uprawnienia). Probe wykonujemy tylko raz przed zapamietaniem sciezki.
+            with tempfile.NamedTemporaryFile(dir=candidate, prefix=".write-test-") as probe:
+                probe.write(b"\0")
+                probe.flush()
+        except OSError:
+            continue
         _data_dir = candidate
-    except OSError:
-        _data_dir = _SOURCE_DIR
+        break
+    else:
+        # Nie zapisujemy do _MEIPASS, nawet jesli wszystkie katalogi sa zablokowane.
+        # Warstwa zapisu zwroci niepowodzenie, a GUI pozwoli nadal monitorowac.
+        _data_dir = candidates[-1]
 
     return _data_dir
 
@@ -100,7 +110,13 @@ def data_file(name):
 
 
 def _adopt_from_source(name, target):
-    source = os.path.join(_SOURCE_DIR, name)
+    legacy_dirs = [_SOURCE_DIR]
+    if is_frozen():
+        legacy_dirs.insert(0, os.path.dirname(os.path.abspath(sys.executable)))
+    sources = [os.path.join(directory, name) for directory in dict.fromkeys(legacy_dirs)]
+    source = next((candidate for candidate in sources if os.path.isfile(candidate)), None)
+    if source is None:
+        return
 
     if os.path.abspath(source) == os.path.abspath(target):
         # Zapasowa sciezka danych pokrywa sie z katalogiem programu.
@@ -108,11 +124,27 @@ def _adopt_from_source(name, target):
     if not os.path.isfile(source):
         return
 
+    temporary = None
     try:
-        shutil.copy2(source, target)
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(target), suffix=".tmp", delete=False) as handle:
+            temporary = handle.name
+        # Kopiujemy dane bez flagi readonly odziedziczonej po starym pliku.
+        shutil.copyfile(source, temporary)
+        # Windows rename atomowo odmawia nadpisania istniejacego celu. Druga
+        # instancja mogla go juz utworzyc od czasu sprawdzenia w data_file().
+        if os.name == "nt":
+            os.rename(temporary, target)
+        else:
+            os.link(temporary, target)
     except OSError:
         # Brak kopii oznacza tylko utrate historii, wiec nie przerywamy startu.
         pass
+    finally:
+        if temporary is not None:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
 
 
 def resource_path(*parts):

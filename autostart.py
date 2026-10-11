@@ -19,6 +19,7 @@ do momentu az GG sie podniesie.
 """
 
 import os
+import shlex
 import winreg
 
 import paths
@@ -53,7 +54,7 @@ def current_entry():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
             value, _ = winreg.QueryValueEx(key, ENTRY_NAME)
-            return value
+            return value if isinstance(value, str) else None
     except FileNotFoundError:
         return None
     except OSError:
@@ -62,14 +63,15 @@ def current_entry():
 
 def is_enabled():
     """Czy program jest ustawiony na uruchamianie z Windows."""
-    return current_entry() is not None
+    entry = current_entry()
+    return isinstance(entry, str) and bool(entry.strip())
 
 
-def enable():
+def enable(entry=None):
     """Dodaje wpis autostartu. Zwraca True, gdy sie udalo."""
     try:
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-            winreg.SetValueEx(key, ENTRY_NAME, 0, winreg.REG_SZ, command())
+            winreg.SetValueEx(key, ENTRY_NAME, 0, winreg.REG_SZ, command() if entry is None else entry)
         return True
     except OSError:
         return False
@@ -91,6 +93,15 @@ def set_enabled(enabled):
     return enable() if enabled else disable()
 
 
+def _entry_arguments(entry):
+    if not isinstance(entry, str) or not entry.strip():
+        return []
+    try:
+        return [part.strip('"') for part in shlex.split(entry, posix=False)]
+    except ValueError:
+        return []
+
+
 def entry_target(entry):
     """Wyciaga z polecenia sciezke programu, ktory ma sie uruchomic.
 
@@ -99,15 +110,24 @@ def entry_target(entry):
     zostaje pierwszy czlon rozdzielony spacja, co dla sciezki ze spacja da
     wynik bledny, ale tylko na tyle, ze uznamy wpis za nieaktualny.
     """
-    if not entry:
-        return None
+    arguments = _entry_arguments(entry)
+    return arguments[0] if arguments and arguments[0] else None
 
-    if entry.startswith('"'):
-        closing = entry.find('"', 1)
-        if closing > 1:
-            return entry[1:closing]
 
-    return entry.split(" ", 1)[0]
+def _entry_targets(entry):
+    """Sprawdza takze skrypt Pythona, bo istnienie interpretera nie wystarcza."""
+    target = entry_target(entry)
+    if not target:
+        return ()
+    targets = [target]
+    executable = os.path.basename(target).lower()
+    if executable.startswith("python") and executable.endswith(".exe"):
+        arguments = _entry_arguments(entry)
+        for argument in arguments[1:]:
+            if argument.lower().endswith((".py", ".pyw")):
+                targets.append(argument)
+                break
+    return targets
 
 
 def repair_if_stale():
@@ -129,10 +149,12 @@ def repair_if_stale():
     if existing is None or existing == command():
         return False
 
-    target = entry_target(existing)
-    if target and os.path.isfile(target):
+    targets = _entry_targets(existing)
+    if targets and all(os.path.isfile(target) for target in targets):
         # Wpis prowadzi do dzialajacego programu - byc moze innej kopii, ale to
         # wybor uzytkownika, nie usterka.
+        if TRAY_ARGUMENT not in _entry_arguments(existing)[1:]:
+            return enable(existing.strip() + " " + TRAY_ARGUMENT)
         return False
 
     return enable()

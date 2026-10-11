@@ -37,6 +37,7 @@ Trzy rzeczy, ktore roznia rodziny miedzy soba
    usage page nie jest potwierdzone w zadnym zrodle, wiec musi byc opcjonalne.
 """
 
+import re
 import time
 
 import hid
@@ -48,6 +49,11 @@ VENDOR_ID = 0x1038
 
 # Ile czasu czekamy na raport bedacy odpowiedzia na nasze zapytanie.
 _QUERY_TIMEOUT_SECONDS = 0.5
+
+# Odbiorniki nadaja takze spontaniczne raporty. Oproznienie ich kolejki musi
+# miec limit, inaczej stale aktywny interfejs moze zatrzymac caly monitor.
+_DRAIN_TIMEOUT_SECONDS = 0.05
+_MAX_DRAIN_REPORTS = 256
 
 
 def _scale(value, raw_min, raw_max):
@@ -129,6 +135,8 @@ def _parse_nova_7(pid, data):
         return None
 
     if pid in _NOVA_7_DISCRETE_PIDS:
+        if not 0 <= data[2] <= 4:
+            return None
         percent = _scale(data[2], 0, 4)
     else:
         percent = min(100, data[2])
@@ -175,6 +183,8 @@ def _parse_nova_pro(pid, data):
         # Nieznany stan - lepiej zglosic brak danych niz zgadywac.
         return None
 
+    if not 0 <= data[6] <= 8:
+        return None
     return _scale(data[6], 0, 8), status == 0x02
 
 
@@ -191,6 +201,8 @@ def _parse_arctis_7_plus(pid, data):
     if data[1] == 0x01:
         return None
 
+    if not 0 <= data[2] <= 4:
+        return None
     return _scale(data[2], 0, 4), data[3] == 0x01
 
 
@@ -253,7 +265,7 @@ def _parse_arctis_pro_wireless(pid, data):
     zapytanie (patrz "status_request" w rodzinie).
     """
     del pid
-    if not data:
+    if not data or not 0 <= data[0] <= 4:
         return None
 
     return _scale(data[0], 0, 4), False
@@ -299,6 +311,10 @@ PROTOCOL_FAMILIES = {
             LINK_WIRED: (0x00, 0x92),
         },
         "read_length": 64,
+        "minimum_length": 2,
+        # 0xff jest znana odpowiedzia wylaczonej myszy; inne wartosci poza
+        # krokami 1-21 nie powinny zaslaniac kolejnego prawidlowego raportu.
+        "valid_response": lambda data: data[1] == 0xFF or 1 <= (data[1] & 0x7F) <= 21,
         "echoes_opcode": True,
         "parse": _parse_aerox,
     },
@@ -312,6 +328,7 @@ PROTOCOL_FAMILIES = {
             LINK_WIRED: (0x00, 0xAA, 0x01),
         },
         "read_length": 3,
+        "minimum_length": 3,
         # Bajt zerowy odpowiedzi to poziom baterii, wiec nie ma tu echa opcodu.
         "echoes_opcode": False,
         "parse": _parse_rival,
@@ -325,6 +342,7 @@ PROTOCOL_FAMILIES = {
             LINK_WIRED: (0x00, 0xAA, 0x01),
         },
         "read_length": 3,
+        "minimum_length": 3,
         "echoes_opcode": False,
         "parse": _parse_rival,
     },
@@ -334,6 +352,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": 0xFFC0,
         "requests": {LINK_24: (0x00, 0xB0)},
         "read_length": 64,
+        "minimum_length": 4,
         "echoes_opcode": True,
         "parse": _parse_nova_7,
     },
@@ -342,6 +361,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": 0xFFC0,
         "requests": {LINK_24: (0x00, 0xB0)},
         "read_length": 64,
+        "minimum_length": 16,
         # HeadsetControl czyta tu pierwszy raport, jaki przyjdzie. Nie mam tego
         # sprzetu, wiec nie zakladam echa - blednie zalozone odcieloby odczyt
         # calkowicie, a bez niego najwyzej trafimy w obcy raport, ktory odsieje
@@ -356,6 +376,7 @@ PROTOCOL_FAMILIES = {
         # Ta rodzina wysyla pelny 31-bajtowy raport, nie dwa bajty.
         "write_length": 31,
         "read_length": 128,
+        "minimum_length": 16,
         "echoes_opcode": False,
         "parse": _parse_nova_pro,
     },
@@ -364,6 +385,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": 0xFFC0,
         "requests": {LINK_24: (0x00, 0xB0)},
         "read_length": 64,
+        "minimum_length": 4,
         "echoes_opcode": False,
         "parse": _parse_arctis_7_plus,
     },
@@ -372,6 +394,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": None,
         "requests": {LINK_24: (0x06, 0x18)},
         "read_length": 8,
+        "minimum_length": 3,
         "echoes_opcode": False,
         "parse": _parse_arctis_7,
     },
@@ -381,6 +404,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": 0xFF43,
         "requests": {LINK_24: (0x06, 0x12)},
         "read_length": 8,
+        "minimum_length": 4,
         "echoes_opcode": False,
         "parse": _parse_arctis_1,
     },
@@ -389,6 +413,7 @@ PROTOCOL_FAMILIES = {
         "usage_page": None,
         "requests": {LINK_24: (0x00, 0x20)},
         "read_length": 12,
+        "minimum_length": 5,
         "echoes_opcode": False,
         "parse": _parse_arctis_9,
     },
@@ -400,9 +425,13 @@ PROTOCOL_FAMILIES = {
         "status_request": (0x41, 0xAA),
         "status_length": 2,
         "status_offline": lambda data: bool(data) and data[0] == 0x02,
+        # Odpowiedz czytamy do 2 bajtow, ale znaczenie ma tylko bajt zerowy.
+        "status_online": lambda data: bool(data) and data[0] == 0x04,
+        "status_valid": lambda data: data[0] in (0x02, 0x04),
         "requests": {LINK_24: (0x40, 0xAA)},
         "write_length": 31,
         "read_length": 1,
+        "minimum_length": 1,
         "echoes_opcode": False,
         "parse": _parse_arctis_pro_wireless,
     },
@@ -435,35 +464,37 @@ def _plan_for(pid):
 def _find_path(pid, interface, usage_page):
     """Zwraca sciezke HID do interfejsu vendorowego danego urzadzenia.
 
-    Windows czesto podaje interface_number rowny -1, a dla czterech modeli nie
-    znamy usage page. Dlatego dopasowanie jest stopniowe: najpierw po obu
-    kryteriach, potem po tym, ktore jest dostepne, a na koniec bierzemy
-    pierwsza sciezke tego PID-u. Zle zgadniete kryterium ma prowadzic do proby
-    odczytu, a nie do cichego "brak danych".
+    Windows czasem podaje interface_number rowny -1; wtedy numer odczytujemy
+    z segmentu mi_XX sciezki USB. Nie wysylamy komendy do pierwszego dowolnego
+    interfejsu: moze on przenosic zwykle zdarzenia myszy lub klawiatury.
     """
     entries = list(hid.enumerate(VENDOR_ID, pid))
     if not entries:
         return None
 
-    def matches_interface(entry):
-        return entry["interface_number"] == interface
+    def interface_for(entry):
+        number = entry.get("interface_number")
+        if isinstance(number, int) and number >= 0:
+            return number
+        path = entry.get("path", b"")
+        text = path.decode("ascii", errors="ignore") if isinstance(path, bytes) else str(path)
+        match = re.search(r"(?:[&#])mi_([0-9a-f]{2})(?:[&#]|$)", text, re.IGNORECASE)
+        return int(match[1], 16) if match else None
 
     def matches_usage(entry):
-        return usage_page is None or entry["usage_page"] == usage_page
+        return usage_page is None or entry.get("usage_page") == usage_page
 
     for entry in entries:
-        if matches_interface(entry) and matches_usage(entry):
+        if interface_for(entry) == interface and matches_usage(entry):
             return entry["path"]
 
+    # Usage page zastapi numer tylko wtedy, gdy numeru naprawde nie znamy.
+    # Jawnie inny numer lub usage page nie jest kandydatem do zgadywania.
     for entry in entries:
-        if matches_usage(entry) and usage_page is not None:
+        if usage_page is not None and matches_usage(entry) and interface_for(entry) is None:
             return entry["path"]
 
-    for entry in entries:
-        if matches_interface(entry):
-            return entry["path"]
-
-    return entries[0]["path"]
+    return None
 
 
 def _write(handle, request, write_length):
@@ -471,71 +502,104 @@ def _write(handle, request, write_length):
     if write_length and len(payload) < write_length:
         # Czesc rodzin oczekuje pelnego raportu dopelnionego zerami.
         payload = payload + bytes(write_length - len(payload))
-    handle.write(payload)
+    # Backend Windows dopelnia raport do OutputReportByteLength i zwraca
+    # dlugosc po dopelnieniu. Wiekszy wynik jest wiec poprawnym zapisem.
+    if handle.write(payload) < len(payload):
+        raise OSError("Incomplete HID query write")
 
 
-def _query(handle, request, read_length, echoes_opcode=False, write_length=None):
+def _query(
+    handle, request, read_length, echoes_opcode=False, write_length=None, minimum_length=1,
+    cancel_event=None, valid_response=None,
+):
     """Wysyla zapytanie i zwraca raport bedacy na nie odpowiedzia.
 
     Gdy protokol echem potwierdza komende, czekamy na raport zaczynajacy sie
     opcodem, czyli ostatnim bajtem tego, co wyslalismy - to odsiewa raporty,
     ktore odbiornik nadaje sam z siebie kilkadziesiat razy na sekunde. Gdy echa
-    nie ma, bierzemy pierwszy raport, jaki przyjdzie; obcy odczyt zostanie
-    wtedy odrzucony przez walidacje zakresu w parserze.
+    nie ma, bierzemy pierwszy raport o wymaganej minimalnej dlugosci.
+    Raporty za krotkie nie koncza proby przed wlasciwa odpowiedzia.
     """
     expected = request[-1] if echoes_opcode else None
 
+    def cancelled():
+        return cancel_event is not None and cancel_event.is_set()
+
+    if cancelled():
+        return None
     handle.set_nonblocking(1)
 
-    while handle.read(read_length):
-        pass
+    drain_deadline = time.monotonic() + _DRAIN_TIMEOUT_SECONDS
+    for _ in range(_MAX_DRAIN_REPORTS):
+        if cancelled():
+            return None
+        if not handle.read(read_length):
+            break
+        if time.monotonic() >= drain_deadline:
+            return None
+    else:
+        # Nie wiemy, czy stary raport z kolejki odpowiadalby naszemu pytaniu.
+        # Konczymy bez wysylania, zamiast uznac stara baterie za nowy pomiar.
+        return None
 
+    if cancelled():
+        return None
     _write(handle, request, write_length)
 
     deadline = time.monotonic() + _QUERY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
+        if cancelled():
+            return None
         data = handle.read(read_length)
+        if cancelled():
+            return None
         if not data:
-            time.sleep(0.005)
+            if cancel_event is None:
+                time.sleep(0.005)
+            elif cancel_event.wait(0.005):
+                return None
             continue
-        if expected is None or data[0] == expected:
+        if (len(data) >= minimum_length and (expected is None or data[0] == expected)
+                and (valid_response is None or valid_response(data))):
             return data
 
     return None
 
 
-def read_battery(pid):
+def read_battery(pid, cancel_event=None):
     """Zwraca (procent, czy_laduje) dla urzadzenia o danym PID, albo None.
 
     None oznacza, ze urzadzenie jest wylaczone, poza zasiegiem, albo ze nie
     udalo sie otworzyc interfejsu.
     """
+    if cancel_event is not None and cancel_event.is_set():
+        return None
     plan = _plan_for(pid)
     if plan is None:
         return None
 
     _, _, family, request = plan
 
-    path = _find_path(pid, family["interface"], family["usage_page"])
-    if path is None:
-        return None
-
-    handle = hid.device()
+    handle = None
     try:
+        path = _find_path(pid, family["interface"], family["usage_page"])
+        if path is None or (cancel_event is not None and cancel_event.is_set()):
+            return None
+        handle = hid.device()
         handle.open_path(path)
-    except (OSError, IOError):
-        # Interfejs zajety na wylacznosc przez inny proces.
-        return None
-
-    try:
-        return _read_opened(handle, pid, family, request)
+        return _read_opened(handle, pid, family, request, cancel_event=cancel_event)
     except (OSError, IOError):
         return None
     finally:
-        handle.close()
+        if handle is not None:
+            try:
+                handle.close()
+            except (OSError, IOError):
+                # Odlaczenie USB przy sprzataniu nie uniewaznia wyniku odczytu.
+                pass
 
 
-def _read_opened(handle, pid, family, request):
+def _read_opened(handle, pid, family, request, cancel_event=None):
     """Zadaje pytania na otwartym uchwycie i parsuje odpowiedz."""
     write_length = family.get("write_length")
 
@@ -544,13 +608,19 @@ def _read_opened(handle, pid, family, request):
         # Protokol dwuetapowy: bez tego pytania nie odroznimy wylaczonych
         # sluchawek od naladowanych, bo samo zapytanie o baterie nie zawiera
         # informacji o obecnosci urzadzenia.
-        status = _query(
-            handle,
-            status_request,
-            family["status_length"],
-            write_length=write_length,
-        )
-        if status is None or family["status_offline"](status):
+        status = None
+        for _ in range(2):
+            status = _query(
+                handle,
+                status_request,
+                family["status_length"],
+                write_length=write_length,
+                cancel_event=cancel_event,
+                valid_response=family["status_valid"],
+            )
+            if status is not None:
+                break
+        if status is None or not family["status_online"](status):
             return None
 
     # Pierwsze zapytanie po otwarciu interfejsu czasem przepada, dlatego
@@ -562,6 +632,9 @@ def _read_opened(handle, pid, family, request):
             family["read_length"],
             echoes_opcode=family["echoes_opcode"],
             write_length=write_length,
+            minimum_length=family.get("minimum_length", 1),
+            cancel_event=cancel_event,
+            valid_response=family.get("valid_response"),
         )
         if data:
             return family["parse"](pid, data)

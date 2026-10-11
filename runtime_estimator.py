@@ -33,6 +33,7 @@ gdy "1.7 pkt/h" wymaga dzielenia w glowie. Liczba idzie tylko do okna: na
 ekranie 128x40 nie ma dla niej miejsca obok procentu, czasu pracy i ubytku.
 """
 
+import math
 from typing import NamedTuple
 
 import i18n
@@ -93,22 +94,30 @@ class Estimate(NamedTuple):
 # ---------------------------------------------------------------------------
 
 
+def _finite(value):
+    try:
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    except OverflowError:
+        return False
+
+
 def rate_from(drop, hours):
     """Tempo w punktach na godzine z zaobserwowanego spadku, albo None.
 
     Zwraca None takze przy spadku zerowym lub ujemnym: urzadzenie, ktore nic
     nie traci, nie pozwala niczego przewidziec.
     """
-    if hours is None or hours <= 0:
+    if not _finite(hours) or hours <= 0:
         return None
-    if drop is None or drop <= 0:
+    if not _finite(drop) or drop <= 0:
         return None
-    return drop / hours
+    rate = drop / hours
+    return rate if _finite(rate) and rate > 0 else None
 
 
 def session_rate(drop, hours):
     """Tempo biezacej sesji, ale tylko gdy probka jest dosc duza, by cos znaczyc."""
-    if drop is None or hours is None:
+    if not _finite(drop) or not _finite(hours):
         return None
     if drop < MIN_SESSION_DROP or hours < MIN_SESSION_HOURS:
         return None
@@ -122,7 +131,9 @@ def history_rate(cycles, limit=HISTORY_CYCLES):
     arytmetyczna temp poszczegolnych cykli. Inaczej dwugodzinny cykl wazylby
     tyle samo co czterdziestogodzinny, choc mowi o urzadzeniu znacznie mniej.
     """
-    recent = [cycle for cycle in list(cycles)[-limit:] if cycle.hours > 0]
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    recent = [cycle for cycle in cycles if rate_from(cycle.drop, cycle.hours) is not None][-limit:]
     if not recent:
         return None
 
@@ -138,6 +149,8 @@ def blend_rates(from_session, from_history):
     z zerem zanizyloby albo zawyzyloby wynik zaleznie od tego, ktorego brakuje,
     zamiast po prostu oprzec sie na tym, co wiemy.
     """
+    from_session = from_session if _finite(from_session) and from_session > 0 else None
+    from_history = from_history if _finite(from_history) and from_history > 0 else None
     if from_session is not None and from_history is not None:
         blended = WEIGHT_SESSION * from_session + WEIGHT_HISTORY * from_history
         return blended, SOURCE_BLENDED
@@ -168,7 +181,7 @@ def estimate(state, rated=None):
         return Estimate(None, None, None)
 
     level = state.level
-    if level is None:
+    if not _finite(level) or not 0 <= level <= 100:
         return Estimate(None, None, None)
 
     # Oba tempa biora tylko to, co zmierzone na laczu uzywanym w tej chwili.
@@ -185,8 +198,9 @@ def estimate(state, rated=None):
 
     # Nie ma jeszcze zadnego pomiaru - zostaja dane producenta, przeliczone
     # proporcjonalnie do biezacego poziomu.
-    if rated:
-        return Estimate(rated * level / 100.0, SOURCE_RATED, rate_from(100.0, rated))
+    if _finite(rated) and rated > 0:
+        hours = min(rated * (level / 100.0), MAX_ESTIMATE_HOURS)
+        return Estimate(hours, SOURCE_RATED, rate_from(100.0, rated))
 
     return Estimate(None, None, None)
 
@@ -203,7 +217,7 @@ def hours_per_point(rate):
     drugi raz dawaloby dokladnie te sama wartosc, tylko z ryzykiem, ze kiedys
     rozjedzie sie z ta, na ktorej opiera sie czas pracy pokazany obok.
     """
-    if not rate or rate <= 0:
+    if not _finite(rate) or rate <= 0:
         return None
 
     return min(1.0 / rate, MAX_PER_POINT_HOURS)
@@ -221,7 +235,7 @@ def format_per_point(hours, source=None):
     do kilkudziesieciu minut, wiec zaokraglenie do pelnych godzin - jak w czasie
     pozostalym - zamienialoby caly ten wskaznik w "<1h" i nic by nie mowilo.
     """
-    if hours is None:
+    if not _finite(hours) or hours < 0:
         return ""
 
     prefix = "~" if source == SOURCE_RATED else ""
@@ -244,7 +258,7 @@ def format_hours(hours, source=None):
     Ponizej godziny pokazujemy "<1h", a nie "0h" - zero sugerowaloby, ze
     urzadzenie juz sie wylaczylo, a chodzi o ostatnie minuty pracy.
     """
-    if hours is None:
+    if not _finite(hours) or hours < 0:
         return ""
 
     prefix = "~" if source == SOURCE_RATED else ""
@@ -261,7 +275,7 @@ def format_elapsed(hours):
     Tutaj minuty maja sens: to zmierzony czas, ktory naprawde uplynal, a nie
     przewidywanie. Wynik jest wiec dokladniejszy niz sam szacunek.
     """
-    if hours is None:
+    if not _finite(hours) or hours < 0:
         return ""
 
     if hours < 1:
@@ -287,7 +301,7 @@ def format_drop(points):
     Zero zwracamy jako pusty napis. "-0%" tuz po odlaczeniu kabla nie wnosi nic,
     a ekran 128x40 jest za ciasny, zeby trzymac na nim napis bez tresci.
     """
-    if not points:
+    if not _finite(points) or points <= 0:
         return ""
 
     return f"-{int(points)}%"

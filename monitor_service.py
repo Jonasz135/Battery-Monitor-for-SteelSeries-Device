@@ -27,6 +27,7 @@ import json
 import os
 import threading
 import time
+from urllib.parse import urlsplit
 
 import requests
 
@@ -53,6 +54,9 @@ DEVELOPER = "Local"
 
 # Jak czesto naprawde odpytujemy urzadzenia o poziom baterii.
 BATTERY_POLL_SECONDS = 60
+
+# Szybsze wykrywanie wlaczonego sprzetu, bez uruchamiania PowerShella co sekunde.
+OFFLINE_POLL_SECONDS = 10
 
 # Jak czesto wysylamy zdarzenie na ekran, przelaczajac sie na kolejne urzadzenie.
 # Krotszy niz 15 s timeout GameSense, wiec kazda wysylka dziala tez jak keepalive.
@@ -140,17 +144,27 @@ def find_server_address():
         raise GameSenseUnavailable("service.gg_missing")
 
     try:
-        with open(core_props_path, "r", encoding="utf-8") as handle:
+        with open(core_props_path, "r", encoding="utf-8-sig") as handle:
             core_props = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, UnicodeError) as exc:
         raise GameSenseUnavailable("service.coreprops_unreadable", error=exc) from exc
 
     # Plik zawiera tez "encryptedAddress" i "ggEncryptedAddress" - to kanaly
     # szyfrowane, ktorych zwykle JSON API nie uzywa. Nas interesuje "address".
-    address = core_props.get("address")
-    if not address:
+    address = core_props.get("address") if isinstance(core_props, dict) else None
+    if not isinstance(address, str) or not address.strip():
         raise GameSenseUnavailable("service.coreprops_no_address")
-
+    address = address.strip()
+    try:
+        parsed = urlsplit(f"http://{address}")
+        valid = (parsed.hostname in ("127.0.0.1", "localhost", "::1")
+                 and parsed.port is not None and 0 < parsed.port <= 65535
+                 and not parsed.username and not parsed.password
+                 and not parsed.path and not parsed.query and not parsed.fragment)
+    except ValueError:
+        valid = False
+    if not valid:
+        raise GameSenseUnavailable("service.coreprops_no_address")
     return address
 
 
@@ -166,6 +180,11 @@ class GameSenseClient:
         self.address = address
         self.base_url = f"http://{address}"
         self.session = requests.Session()
+        # GameSense jest lokalne: firmowy proxy nie powinien przejmowac zapytan.
+        self.session.trust_env = False
+
+    def close(self):
+        self.session.close()
 
     def _post(self, endpoint, payload):
         """Wysyla payload jako JSON i podnosi wyjatek przy odpowiedzi != 2xx."""
@@ -173,8 +192,11 @@ class GameSenseClient:
             f"{self.base_url}{endpoint}",
             json=payload,
             timeout=HTTP_TIMEOUT_SECONDS,
+            allow_redirects=False,
         )
         response.raise_for_status()
+        if not 200 <= response.status_code < 300:
+            raise requests.HTTPError("Unexpected GameSense response", response=response)
         return response
 
     def register_metadata(self):
@@ -295,6 +317,7 @@ def _offline_entries(readings, declared, log):
                 "rate_per_hour": None,
                 "per_point_hours": None,
                 "since_charge": "",
+                "since_charge_hours": None,
                 "drop_since_charge": None,
             }
         )
@@ -308,7 +331,7 @@ def _offline_entries(readings, declared, log):
     return entries
 
 
-def read_all_batteries(log=None, timeline=None, declared=()):
+def read_all_batteries(log=None, timeline=None, declared=(), cancel_event=None):
     """Zbiera odczyty z obu mozliwych drog: HID (dongle albo kabel) oraz Bluetooth.
 
     To samo urzadzenie moze byc widoczne jednoczesnie na oba sposoby - mysz
@@ -323,15 +346,28 @@ def read_all_batteries(log=None, timeline=None, declared=()):
     urzadzenia wylaczonego od takiego, ktorego uzytkownik nie ma.
     """
     log = log or (lambda message: None)
+    if cancel_event is not None and cancel_event.is_set():
+        return []
 
     by_model = {}
-    used_labels = set()
+    try:
+        hid_devices = battery_hid.discover_devices()
+    except Exception as exc:
+        log(i18n.t("log.read_error", transport="HID", error=repr(exc)))
+        hid_devices = []
 
-    for device in battery_hid.discover_devices():
+    for device in hid_devices:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if declared and device["key"] not in declared:
             continue
 
-        result = battery_hid.read_battery(device["pid"])
+        try:
+            result = (battery_hid.read_battery(device["pid"], cancel_event=cancel_event)
+                      if cancel_event is not None else battery_hid.read_battery(device["pid"]))
+        except Exception as exc:
+            log(i18n.t("log.read_error", transport=device["name"], error=repr(exc)))
+            continue
         if result is None:
             log(i18n.t("log.device_no_data", name=device["name"]))
             continue
@@ -345,15 +381,17 @@ def read_all_batteries(log=None, timeline=None, declared=()):
         # dwa sprzeczne odczyty w jednym cyklu odpytywania wygladalyby jak
         # migotanie ladowania. Pierwszenstwo ma ten, ktory zglasza ladowanie,
         # bo tylko wpis kablowy wie o nim prawde.
-        existing = by_model.get(device["model"])
+        identity = device["key"] or device["model"]
+        existing = by_model.get(identity)
         if existing is not None and not (charging and not existing["charging"]):
             log(i18n.t("log.device_duplicate", name=device["name"], percent=percent))
             continue
 
-        by_model[device["model"]] = {
+        by_model[identity] = {
             "name": device["name"],
             "model": device["model"],
             "key": device["key"],
+            "link": device["link"],
             "label": device["label"],
             "rated_hours": device["rated_hours"],
             "percent": percent,
@@ -361,7 +399,6 @@ def read_all_batteries(log=None, timeline=None, declared=()):
             "online": True,
             "supported": True,
         }
-        used_labels.add(device["label"])
         log(
             i18n.t("log.device_value", name=device["name"], percent=percent)
             + (i18n.t("log.device_charging_suffix") if charging else "")
@@ -369,10 +406,22 @@ def read_all_batteries(log=None, timeline=None, declared=()):
 
     readings = list(by_model.values())
 
-    for device in battery_bluetooth.read_all():
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    try:
+        bt_devices = (battery_bluetooth.read_all(cancel_event=cancel_event)
+                      if cancel_event is not None else battery_bluetooth.read_all())
+    except Exception as exc:
+        log(i18n.t("log.read_error", transport="Bluetooth", error=repr(exc)))
+        bt_devices = []
+
+    seen = set(by_model)
+    for source in bt_devices:
+        device = dict(source)
         if declared and device["key"] not in declared:
             continue
-        if device["label"] in used_labels:
+        identity = device["key"] or device["model"]
+        if identity in seen:
             log(
                 i18n.t(
                     "log.device_bt_duplicate",
@@ -383,8 +432,10 @@ def read_all_batteries(log=None, timeline=None, declared=()):
             continue
         device["online"] = True
         device["supported"] = True
+        if device["key"]:
+            device["model"] = device_catalog.by_key(device["key"]).name
         readings.append(device)
-        used_labels.add(device["label"])
+        seen.add(identity)
         log(i18n.t("log.device_value", name=device["name"], percent=device["percent"]))
 
     readings.extend(_offline_entries(readings, declared, log))
@@ -393,7 +444,16 @@ def read_all_batteries(log=None, timeline=None, declared=()):
     # i liczymy szacunki.
     timeline = timeline or battery_timeline.default_timeline()
 
+    if cancel_event is not None and cancel_event.is_set():
+        return []
+    online_keys = {r["key"] or r["model"] for r in readings if r["online"]}
+    for key in timeline.devices():
+        if key not in online_keys:
+            timeline.mark_offline(key)
+
     for reading in readings:
+        if cancel_event is not None and cancel_event.is_set():
+            return []
         if not reading["online"]:
             continue
 
@@ -409,6 +469,10 @@ def read_all_batteries(log=None, timeline=None, declared=()):
             reading["charging"],
             link=reading.get("link") or battery_timeline.DEFAULT_LINK,
         )
+        # Filtr historii jest tez filtrem prezentacji, inaczej ekran pokazywal
+        # odrzucony odczyt obok szacunku policzonego z poprzedniego poziomu.
+        reading["percent"] = state.level
+        reading["charging"] = state.charging
         result = runtime_estimator.estimate(state, reading["rated_hours"])
 
         reading["runtime"] = (
@@ -428,6 +492,7 @@ def read_all_batteries(log=None, timeline=None, declared=()):
         # wtedy, gdy sami widzielismy moment odlaczenia kabla. Oba pola sa
         # puste dokladnie w tych samych sytuacjach, bo opisuja te sama sesje.
         reading["since_charge"] = runtime_estimator.format_elapsed(state.hours_since_charge)
+        reading["since_charge_hours"] = state.hours_since_charge
         reading["drop_since_charge"] = state.drop_since_charge
 
         if result.hours is not None:
@@ -488,12 +553,19 @@ class MonitorService:
 
         self._stop = threading.Event()
         self._refresh = threading.Event()
+        self._wake = threading.Event()
+        self._sleep_interrupted = False
         self._paused = threading.Event()
         self._thread = None
+        self._control_lock = threading.Lock()
+        self._poll_thread = None
+        self._poll_lock = threading.Lock()
 
         self._lock = threading.Lock()
         self._readings = []
-        self._last_poll_monotonic = 0.0
+        self._last_poll_monotonic = None
+        self._settings_revision = 0
+        self._preview_epoch = time.monotonic()
         self._snapshot = {
             "connected": False,
             "address": None,
@@ -502,6 +574,7 @@ class MonitorService:
             "status_key": "service.not_started",
             "status_params": {},
             "readings": [],
+            "readings_revision": 0,
             "last_poll": None,
             "frame": None,
             "frame_label": "",
@@ -512,23 +585,45 @@ class MonitorService:
     # -- sterowanie ---------------------------------------------------------
 
     def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._run, name="MonitorService", daemon=True)
-        self._set_status("service.starting", running=True)
-        self._thread.start()
+        with self._control_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._refresh.set()
+            self._wake.set()
+            self._preview_epoch = time.monotonic()
+            self._thread = threading.Thread(target=self._run, name="MonitorService", daemon=True)
+            self._set_status("service.starting", running=True)
+            try:
+                self._thread.start()
+            except Exception:
+                self._thread = None
+                self._set_status("service.stopped", running=False, connected=False, address=None)
+                raise
 
     def stop(self, timeout=5.0):
-        self._stop.set()
-        thread = self._thread
+        with self._control_lock:
+            self._stop.set()
+            thread = self._thread
+        # Callback watku moze wywolac start/stop. Join pod blokada czekalby
+        # wtedy na callback, ktory sam czeka na te sama blokade.
         if thread is not None and thread.is_alive():
+            if thread is threading.current_thread() or self._poll_thread is threading.current_thread():
+                return False
             thread.join(timeout)
-        self._thread = None
-        self._set_status("service.stopped", running=False, connected=False)
+        with self._control_lock:
+            if thread is not None and thread.is_alive():
+                return False
+            if self._thread is not thread:
+                # Nowe start() po zakonczeniu starego watku ma pierwszenstwo.
+                return True
+            self._thread = None
+            self._set_status("service.stopped", running=False, connected=False, address=None)
+            return True
 
     def refresh_now(self):
         self._refresh.set()
+        self._wake.set()
 
     def reload_settings(self):
         """Wczytuje ustawienia od nowa i natychmiast odswieza odczyty.
@@ -537,15 +632,20 @@ class MonitorService:
         ktorych uzytkownik juz nie zaznaczyl, musza zniknac od razu, a nie dopiero
         przy nastepnym odczycie.
         """
-        self._settings = app_settings.Settings()
-        self._declared = self._settings.declared
+        new_settings = app_settings.Settings()
         with self._lock:
+            self._settings = new_settings
+            self._declared = new_settings.declared
+            self._settings_revision += 1
             self._readings = []
             self._snapshot["readings"] = []
+            self._snapshot["readings_revision"] += 1
         self._refresh.set()
+        self._wake.set()
 
     def declared_devices(self):
-        return self._declared
+        with self._lock:
+            return self._declared
 
     def set_paused(self, paused):
         if paused:
@@ -565,7 +665,10 @@ class MonitorService:
     def get_snapshot(self):
         """Zwraca kopie biezacego stanu - bezpieczna do czytania z innego watku."""
         with self._lock:
-            return dict(self._snapshot)
+            snapshot = dict(self._snapshot)
+            snapshot["readings"] = [dict(reading) for reading in snapshot["readings"]]
+            snapshot["status_params"] = dict(snapshot["status_params"])
+            return snapshot
 
     def _update(self, **fields):
         with self._lock:
@@ -591,8 +694,14 @@ class MonitorService:
         zatrzymanie i przycisk odswiezenia dzialaja od razu, a nie po doczekaniu
         do konca pelnego cyklu ekranu.
         """
+        self._sleep_interrupted = False
+        if self._stop.is_set():
+            return False
         if seconds <= 0:
-            return not self._stop.is_set()
+            if self._wake.is_set():
+                self._wake.clear()
+                self._sleep_interrupted = True
+            return True
 
         deadline = time.monotonic() + seconds
         while True:
@@ -601,37 +710,88 @@ class MonitorService:
                 return True
             if self._stop.wait(min(remaining, _TICK_SECONDS)):
                 return False
-            if self._refresh.is_set():
+            if self._wake.is_set():
+                self._wake.clear()
+                self._sleep_interrupted = True
                 return True
 
     # -- odczyt -------------------------------------------------------------
 
+    def _poll_due(self):
+        if self._refresh.is_set():
+            return True
+        now = time.monotonic()
+        with self._lock:
+            missing = not self._readings or any(
+                not r["online"] and r.get("supported", True) for r in self._readings
+            )
+            interval = OFFLINE_POLL_SECONDS if missing else BATTERY_POLL_SECONDS
+            return self._last_poll_monotonic is None or now - self._last_poll_monotonic >= interval
+
+    def _schedule_poll_if_due(self):
+        """Jeden odczyt w tle; powolny HID/PowerShell nie blokuje animacji OLED."""
+        with self._poll_lock:
+            if self._stop.is_set() or (self._poll_thread is not None and self._poll_thread.is_alive()):
+                return False
+            if not self._poll_due():
+                return False
+            self._poll_thread = threading.Thread(target=self._poll_if_due, name="BatteryPoll", daemon=True)
+            try:
+                self._poll_thread.start()
+            except Exception:
+                self._poll_thread = None
+                raise
+            return True
+
     def _poll_if_due(self):
         """Odczytuje baterie, gdy minal interwal albo gdy ktos zazadal odswiezenia.
 
-        Przy pustej liscie odczytow ponawiamy probe za kazdym razem, zeby
-        wlaczenie uspionej myszki bylo widoczne w ciagu sekund, a nie po minucie.
+        Przy urzadzeniach offline uzywamy krotszego, ale ograniczonego interwalu.
         """
         forced = self._refresh.is_set()
         if forced:
             self._refresh.clear()
 
-        now = time.monotonic()
-        due = now - self._last_poll_monotonic >= BATTERY_POLL_SECONDS
-
-        if not (forced or due or not self._readings):
+        if not (forced or self._poll_due()):
             return False
+        with self._lock:
+            revision = self._settings_revision
+            declared = self._declared
 
         self._log(i18n.t("log.poll"))
-        self._readings = read_all_batteries(self._log, self._timeline, self._declared)
-        self._last_poll_monotonic = time.monotonic()
-        self._update(readings=list(self._readings), last_poll=time.time())
+        try:
+            readings = read_all_batteries(self._log, self._timeline, declared, cancel_event=self._stop)
+        except Exception as exc:
+            self._log(i18n.t("log.read_error", transport="battery", error=repr(exc)))
+            for key in self._timeline.devices():
+                self._timeline.mark_offline(key)
+            with self._lock:
+                if self._stop.is_set() or revision != self._settings_revision:
+                    return False
+                self._last_poll_monotonic = time.monotonic()
+                self._readings = [dict(
+                    reading, percent=None, charging=False, online=False, runtime="",
+                    runtime_source=None, rate_per_hour=None, per_point_hours=None,
+                    since_charge="", since_charge_hours=None, drop_since_charge=None,
+                ) for reading in self._readings]
+                self._snapshot["readings"] = self._readings
+                self._snapshot["readings_revision"] += 1
+            self._wake.set()
+            return False
+        with self._lock:
+            if self._stop.is_set() or revision != self._settings_revision:
+                return False
+            self._readings = readings
+            self._last_poll_monotonic = time.monotonic()
+            self._snapshot.update(readings=readings, last_poll=time.time())
+            self._snapshot["readings_revision"] += 1
+        self._wake.set()
         return True
 
     # -- rysowanie ----------------------------------------------------------
 
     def _publish(self, frame, label):
-        self._update(frame=frame, frame_label=label)
+        self._update(frame=tuple(frame), frame_label=label)
 
     def _send(self, client, frame, percent):
         """Wysyla klatke, chyba ze monitor jest wstrzymany.
@@ -639,7 +799,7 @@ class MonitorService:
         W pauzie klatki nadal powstaja i trafiaja do podgladu w oknie - wstrzymane
         jest tylko przejmowanie ekranu klawiatury.
         """
-        if not self._paused.is_set():
+        if not self._paused.is_set() and not self._stop.is_set():
             client.send_frame(frame, percent)
 
     def _show_static(self, client, label, percent, runtime_text, seconds, used_text=""):
@@ -663,7 +823,13 @@ class MonitorService:
         # falowaloby razem z obciazeniem maszyny.
         start = time.monotonic()
 
-        for offset in range(frame_count):
+        offset = 0
+        while offset < frame_count and not self._stop.is_set():
+            # Wolny serwer nie powinien powodowac wysylania zaleglych klatek
+            # seriami ani wydluzac czterosekundowej rotacji do kilku minut.
+            offset = max(offset, int(max(0.0, time.monotonic() - start) / frame_delay))
+            if offset >= frame_count:
+                break
             step = first_step + offset
             frame = oled_render.render_frame(
                 label, percent, runtime_text, charging=True, step=step
@@ -671,13 +837,14 @@ class MonitorService:
             self._publish(frame, label)
             self._send(client, frame, percent)
 
-            remaining = start + (offset + 1) * frame_delay - time.monotonic()
+            offset += 1
+            remaining = start + offset * frame_delay - time.monotonic()
             if not self._sleep(remaining):
-                return first_step + offset + 1
-            if self._refresh.is_set():
-                return first_step + offset + 1
+                return first_step + offset
+            if self._sleep_interrupted:
+                return first_step + offset
 
-        return first_step + frame_count
+        return first_step + max(offset, frame_count)
 
     # -- petle --------------------------------------------------------------
 
@@ -696,8 +863,7 @@ class MonitorService:
         animation_step = 0
 
         while not self._stop.is_set():
-            if self._poll_if_due():
-                index = 0
+            self._schedule_poll_if_due()
 
             readings = self._online_readings()
             if not readings:
@@ -720,6 +886,7 @@ class MonitorService:
             runtime_text = current.get("runtime", "")
 
             if current["charging"]:
+                runtime_text = runtime_estimator.charging_text()
                 # W trakcie ladowania licznika ubytku nie pokazujemy: opisuje
                 # zakonczona sesje, a poziom wlasnie rosnie.
                 animation_step = self._show_animated(
@@ -743,22 +910,24 @@ class MonitorService:
         """
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline and not self._stop.is_set():
-            self._poll_if_due()
+            self._schedule_poll_if_due()
             self._publish_preview_only()
-            if not self._sleep(1.0):
+            if not self._sleep(min(1.0 / ANIMATION_FPS, max(0.0, deadline - time.monotonic()))):
                 return
 
     def _publish_preview_only(self):
         """Rysuje klatke do podgladu w oknie, nie wysylajac jej nigdzie."""
         readings = self._online_readings()
         if readings:
-            current = readings[0]
+            elapsed = max(0.0, time.monotonic() - self._preview_epoch)
+            current = readings[int(elapsed / SCREEN_ROTATE_SECONDS) % len(readings)]
             label = i18n.oled_label(current["label"])
             frame = oled_render.render_frame(
                 label,
                 current["percent"],
-                current.get("runtime", ""),
+                runtime_estimator.charging_text() if current["charging"] else current.get("runtime", ""),
                 charging=current["charging"],
+                step=int(elapsed * ANIMATION_FPS),
                 used_text=(
                     ""
                     if current["charging"]
@@ -771,13 +940,52 @@ class MonitorService:
             self._publish(oled_render.render_frame(label, None, ""), label)
 
     def _run(self):
+        """Pilnuje stanu watku i utrwala ostatnie minuty przy zamknieciu."""
+        try:
+            while not self._stop.is_set():
+                try:
+                    self._run_loop()
+                except Exception as exc:
+                    # Blad takze podczas oczekiwania/rysowania podgladu nie
+                    # moze zostawic martwego watku oznaczonego jako running.
+                    self._set_status("service.unexpected_error", {"error": exc},
+                                     connected=False, address=None)
+                    self._log(i18n.t("log.unexpected", error=repr(exc)))
+                    self._stop.wait(RECONNECT_DELAY_SECONDS)
+        finally:
+            try:
+                # Najpierw konczy sie jedyny producent historii. Flush nie
+                # moze wykonywac sie rownolegle z trwajacym record().
+                with self._poll_lock:
+                    poll_thread = self._poll_thread
+                if poll_thread is not None and poll_thread is not threading.current_thread():
+                    poll_thread.join()
+                for key in self._timeline.devices():
+                    self._timeline.mark_offline(key)
+                if not self._timeline.flush():
+                    self._log(i18n.t("log.history_failed"))
+            except Exception as exc:
+                self._log(i18n.t("log.read_error", transport="history", error=repr(exc)))
+            self._set_status("service.stopped", running=False, connected=False, address=None)
+
+    def _run_loop(self):
         """Zewnetrzna petla: odnajduje serwer, rejestruje aplikacje, wznawia po bledzie."""
         while not self._stop.is_set():
+            client = None
             try:
+                self._schedule_poll_if_due()
+                if self._stop.is_set():
+                    return
                 address = find_server_address()
+                if self._stop.is_set():
+                    return
                 client = GameSenseClient(address)
                 client.register_metadata()
+                if self._stop.is_set():
+                    return
                 client.bind_screen_handler()
+                if self._stop.is_set():
+                    return
 
                 self._set_status(
                     "service.connected",
@@ -813,5 +1021,9 @@ class MonitorService:
                 )
                 self._log(i18n.t("log.unexpected", error=repr(exc)))
                 self._idle_loop(RECONNECT_DELAY_SECONDS)
-
-        self._set_status("service.stopped", running=False, connected=False)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception as exc:
+                        self._log(i18n.t("log.gg_error", error=repr(exc)))

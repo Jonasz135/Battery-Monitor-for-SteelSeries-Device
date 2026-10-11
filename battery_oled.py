@@ -38,9 +38,9 @@ def main():
     print(i18n.t("console.header"))
 
     service = monitor_service.MonitorService(on_log=print)
-    service.start()
 
     try:
+        service.start()
         # Praca dzieje sie w watku serwisu; tutaj tylko czekamy na Ctrl+C.
         while service.is_running():
             time.sleep(0.2)
